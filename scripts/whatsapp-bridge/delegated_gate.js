@@ -51,6 +51,58 @@ export function isDelegatedConversationActive(senderId, sessionDir, now = Date.n
   return false;
 }
 
+function isDirectWhatsAppChat(chatId) {
+  const [userPart = '', domainPart = ''] = String(chatId || '').trim().split('@', 2);
+  return Boolean(userPart) && (domainPart === 's.whatsapp.net' || domainPart === 'lid');
+}
+
+function canonicalPhoneJid(value) {
+  const match = String(value || '').trim().match(/^(\d+)(?::\d+)?@s\.whatsapp\.net$/);
+  return match ? `${match[1]}@s.whatsapp.net` : '';
+}
+
+/**
+ * Resolve the narrow delegated-DM exception before the bridge's ordinary
+ * allowlist drop. Baileys owns the LID↔PN mapping: `getPNForLID` reads its
+ * authenticated key state and returns null when it has no verified reverse
+ * mapping. We fail closed for every other chat shape and resolver result.
+ *
+ * The returned senderId is deliberately the canonical PN JID while callers
+ * retain the original chatId. This lets the adapter's intake/delegation path
+ * associate the message with the phone-keyed grant without changing the
+ * Baileys reply route for the LID chat.
+ */
+export async function evaluateDelegatedDirectInbound({
+  senderId,
+  chatId,
+  sessionDir,
+  resolveLidToPhone,
+  now,
+}) {
+  const originalSenderId = String(senderId || '').trim();
+  if (!isDirectWhatsAppChat(chatId)) {
+    return { active: false, senderId: originalSenderId };
+  }
+
+  let resolvedSenderId = canonicalPhoneJid(originalSenderId);
+  if (originalSenderId.endsWith('@lid')) {
+    try {
+      resolvedSenderId = canonicalPhoneJid(await resolveLidToPhone?.(originalSenderId));
+    } catch {
+      // Baileys mapping state is unavailable or has no reverse mapping. Do
+      // not turn an identity-resolution failure into an admission.
+    }
+  }
+  if (!resolvedSenderId) {
+    return { active: false, senderId: originalSenderId };
+  }
+
+  return {
+    active: isDelegatedConversationActive(resolvedSenderId, sessionDir, now),
+    senderId: resolvedSenderId,
+  };
+}
+
 /**
  * Safe, stable identifier for delegation diagnostics.  Do not use this for
  * routing: it intentionally retains only the final four digits and JID kind.

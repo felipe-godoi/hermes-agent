@@ -33,7 +33,7 @@ import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { buildOutboundSendTrace, createOutboundTraceTracker, maskOutboundTarget } from './outbound_trace.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
-import { delegatedContactTag, evaluateDelegatedInbound } from './delegated_gate.js';
+import { delegatedContactTag, evaluateDelegatedDirectInbound, evaluateDelegatedInbound } from './delegated_gate.js';
 import { buildIngressTraceEvents } from './ingress_trace.js';
 import { createSilentBaileysLogger, emitSafeBridgeError, safeBridgeError } from './baileys_logger.js';
 import {
@@ -579,9 +579,9 @@ async function startSocket() {
       if (!msg.message) continue;
 
       const chatId = msg.key.remoteJid;
-      const senderId = msg.key.participant || chatId;
+      let senderId = msg.key.participant || chatId;
       const isGroup = chatId.endsWith('@g.us');
-      const senderNumber = senderId.replace(/@.*/, '');
+      let senderNumber = senderId.replace(/@.*/, '');
       emitDebugEvent({
         stage: 'upsert',
         type,
@@ -684,17 +684,37 @@ async function startSocket() {
           continue;
         }
         const unlistedNonPairingDm =
+          (chatId.endsWith('@s.whatsapp.net') || chatId.endsWith('@lid')) &&
           WHATSAPP_DM_POLICY !== 'pairing' &&
           !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR);
         // Not on the allowlist -- but forward anyway if an owner-granted,
         // TTL-bound delegated conversation is active for this exact sender.
-        // This trace is deliberately limited to this narrow exception path.
-        delegatedInbound = unlistedNonPairingDm && evaluateDelegatedInbound({
-          senderId,
-          sessionDir: SESSION_DIR,
-          messageId: msg.key.id,
-          emit: emitDelegationTrace,
-        });
+        // For a third-party direct LID, ask Baileys' authenticated mapping
+        // state for its canonical phone first; arbitrary/unresolved LIDs fail
+        // closed. This trace is deliberately limited to this narrow exception.
+        if (unlistedNonPairingDm) {
+          const delegatedResolution = await evaluateDelegatedDirectInbound({
+            senderId,
+            chatId,
+            sessionDir: SESSION_DIR,
+            resolveLidToPhone: async lid => sock.signalRepository?.lidMapping?.getPNForLID?.(lid),
+          });
+          if (delegatedResolution.active) {
+            delegatedInbound = evaluateDelegatedInbound({
+              senderId: delegatedResolution.senderId,
+              sessionDir: SESSION_DIR,
+              messageId: msg.key.id,
+              emit: emitDelegationTrace,
+            });
+            // Preserve the original LID chatId for replies, but forward the
+            // verified phone identity so adapter/delegation lookup reaches
+            // the same phone-keyed active grant.
+            if (delegatedInbound) {
+              senderId = delegatedResolution.senderId;
+              senderNumber = senderId.replace(/@.*/, '');
+            }
+          }
+        }
         if (unlistedNonPairingDm && !delegatedInbound) {
           try {
             console.log(JSON.stringify({
