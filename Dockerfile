@@ -291,6 +291,12 @@ COPY --link --chmod=a+rX,go-w . .
 # resolution or downloads.
 RUN uv pip install --no-cache-dir --no-deps -e "."
 
+# ddgs: DuckDuckGo search backend, not bundled by any --extra above. Kept
+# here (rather than as a separate wrapper image downstream) so deployments
+# building straight from this Dockerfile via a git build context get it
+# without needing an extra image layer of their own.
+RUN uv pip install --no-cache-dir ddgs==9.14.4
+
 # Wire the exec shim and install-method stamp.  Files under /opt/hermes are
 # already root-owned (COPY, uv sync, npm install all run as root) and
 # read-only for the hermes user (go-w from the --chmod above).
