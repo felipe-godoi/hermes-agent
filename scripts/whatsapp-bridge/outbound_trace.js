@@ -1,0 +1,98 @@
+/**
+ * Privacy-safe, bounded observability for outbound Baileys messages.
+ *
+ * This intentionally retains only message IDs and safe transport metadata.
+ * Contact identities, message content, and raw Baileys errors never enter it.
+ */
+
+const DEFAULT_TTL_MS = 10 * 60 * 1000;
+
+function safeNumber(value) {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+}
+
+export function maskOutboundTarget(value) {
+  const raw = String(value || '').trim();
+  const [user, domain = ''] = raw.split('@', 2);
+  const suffix = (user.replace(/\D/g, '') || user).slice(-4) || 'unknown';
+  const kind = domain === 'g.us' ? 'group' : domain === 'lid' ? 'lid' : 'jid';
+  return `${kind}:…${suffix}`;
+}
+
+/** Return the allowlisted shape for a /send lifecycle trace. */
+export function buildOutboundSendTrace(stage, fields = {}) {
+  return {
+    stage,
+    target_tag: String(fields.target_tag || 'unknown'),
+    message_id: String(fields.message_id || ''),
+    chunk_count: safeNumber(fields.chunk_count),
+    queue_wait_ms: safeNumber(fields.queue_wait_ms),
+    elapsed_ms: safeNumber(fields.elapsed_ms),
+    connection_state: String(fields.connection_state || 'unknown'),
+  };
+}
+
+function messageIdFrom(event) {
+  return event?.key?.id || event?.receipt?.key?.id || '';
+}
+
+export function createOutboundTraceTracker({
+  maxSize = 128,
+  ttlMs = DEFAULT_TTL_MS,
+  now = () => Date.now(),
+  emit,
+} = {}) {
+  if (!Number.isInteger(maxSize) || maxSize < 1) {
+    throw new RangeError('createOutboundTraceTracker: maxSize must be a positive integer');
+  }
+  const entries = new Map();
+  const clock = typeof now === 'function' ? now : () => Date.now();
+  const write = typeof emit === 'function' ? emit : () => {};
+
+  function expire() {
+    const cutoff = clock() - safeNumber(ttlMs);
+    for (const [id, entry] of entries) {
+      if (entry.acceptedAt < cutoff) entries.delete(id);
+    }
+  }
+
+  function remember(id, metadata = {}) {
+    if (!id) return;
+    expire();
+    entries.set(String(id), { acceptedAt: clock(), ...metadata });
+    while (entries.size > maxSize) entries.delete(entries.keys().next().value);
+  }
+
+  function emitTransition(id, source, status) {
+    expire();
+    if (!id || !entries.has(String(id))) return false;
+    const event = {
+      stage: 'status_transition',
+      message_id: String(id),
+      transition_source: source,
+    };
+    // Baileys status is protocol-derived. Keep it numeric, never stringify
+    // arbitrary update data into diagnostics.
+    if (Number.isFinite(status)) event.baileys_status = safeNumber(status);
+    write(event);
+    return true;
+  }
+
+  function observeMessageUpdates(updates) {
+    for (const update of (Array.isArray(updates) ? updates : [updates])) {
+      if (Number.isFinite(update?.update?.status)) {
+        emitTransition(messageIdFrom(update), 'messages.update', update.update.status);
+      }
+    }
+  }
+
+  function observeReceipts(receipts) {
+    for (const receipt of (Array.isArray(receipts) ? receipts : [receipts])) {
+      // A receipt event is itself an explicit observation. Do not infer
+      // recipient delivery/read state from it, and do not include participant IDs.
+      emitTransition(messageIdFrom(receipt), 'message-receipt.update');
+    }
+  }
+
+  return { remember, observeMessageUpdates, observeReceipts, size: () => (expire(), entries.size) };
+}

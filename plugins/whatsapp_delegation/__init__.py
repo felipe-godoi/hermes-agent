@@ -110,7 +110,7 @@ def _delegation_for_current_session() -> Optional[DelegatedConversation]:
     return get_store().get_active_for_contact(chat_id)
 
 
-def _send_outcome(result: Any) -> tuple[bool, Optional[str], str]:
+def _send_outcome(result: Any) -> tuple[bool, Optional[str], str, Optional[str]]:
     """Interpret an adapter send result without equating no exception to delivery.
 
     The native WhatsApp adapter returns ``SendResult(success=True)`` after the
@@ -120,7 +120,7 @@ def _send_outcome(result: Any) -> tuple[bool, Optional[str], str]:
     explicit negative status fields too.
     """
     if result is False:
-        return False, "adapter rejected the send", "failed"
+        return False, "adapter rejected the send", "failed", None
 
     def field(name: str) -> Any:
         if isinstance(result, dict):
@@ -129,16 +129,16 @@ def _send_outcome(result: Any) -> tuple[bool, Optional[str], str]:
 
     for name in ("success", "delivered", "accepted", "queued"):
         if field(name) is False:
-            return False, str(field("error") or field("message") or "adapter rejected the send"), "failed"
+            return False, str(field("error") or field("message") or "adapter rejected the send"), "failed", None
 
     # Only an adapter that explicitly reports delivery gets to make that
     # stronger claim.  WhatsAppAdapter reports acceptance, not a receipt.
     if field("delivered") is True:
-        return True, None, "delivered"
-    return True, None, "accepted"
+        return True, None, "delivered", field("message_id") or field("messageId")
+    return True, None, "accepted", field("message_id") or field("messageId")
 
 
-async def _send_whatsapp(chat_id: str, text: str) -> tuple[bool, Optional[str], str]:
+async def _send_whatsapp(chat_id: str, text: str) -> tuple[bool, Optional[str], str, Optional[str]]:
     """Send via the already-live WhatsApp adapter (no second Baileys integration)."""
     try:
         from gateway.config import Platform
@@ -146,13 +146,13 @@ async def _send_whatsapp(chat_id: str, text: str) -> tuple[bool, Optional[str], 
 
         runner = _gateway_runner_ref()
         if runner is None:
-            return False, "no live gateway", "failed"
+            return False, "no live gateway", "failed", None
         adapter = runner.adapters.get(Platform.WHATSAPP)
         if adapter is None:
-            return False, "no live WhatsApp adapter", "failed"
+            return False, "no live WhatsApp adapter", "failed", None
         gateway_loop = getattr(runner, "_gateway_loop", None)
         if gateway_loop is None or gateway_loop.is_closed() or not gateway_loop.is_running():
-            return False, "live gateway loop is unavailable", "failed"
+            return False, "live gateway loop is unavailable", "failed", None
 
         try:
             current_loop = asyncio.get_running_loop()
@@ -172,7 +172,7 @@ async def _send_whatsapp(chat_id: str, text: str) -> tuple[bool, Optional[str], 
         return _send_outcome(result)
     except Exception as exc:  # noqa: BLE001 - surfaced to the caller as a tool error
         logger.warning("whatsapp-delegation: send failed: %s", exc, exc_info=True)
-        return False, str(exc), "failed"
+        return False, str(exc), "failed", None
 
 
 def _record_owner_note_in_transcript(delegation: DelegatedConversation, text: str) -> bool:
@@ -373,7 +373,7 @@ async def _tool_start_delegated_conversation(args: dict, **_kwargs) -> str:
     except ValueError as exc:
         return _tool_error(str(exc))
 
-    ok, err, delivery_status = await _send_whatsapp(to_whatsapp_jid(contact), opening_message)
+    ok, err, delivery_status, opening_message_id = await _send_whatsapp(to_whatsapp_jid(contact), opening_message)
     if not ok:
         get_store().close(record.id, reason="opening_send_failed")
         return _tool_error(f"Failed to send opening message: {err}")
@@ -385,6 +385,7 @@ async def _tool_start_delegated_conversation(args: dict, **_kwargs) -> str:
         expires_at=record.expires_at,
         status=record.status,
         opening_message_status=delivery_status,
+        opening_message_id=opening_message_id,
         note=(
             "Opening message accepted by the WhatsApp adapter; recipient delivery "
             "is not confirmed."
@@ -408,7 +409,7 @@ async def _tool_send_delegated_message(args: dict, **_kwargs) -> str:
     if delegation is None or not delegation.is_active:
         return _tool_error("No active delegated conversation with that id.")
 
-    ok, err, _delivery_status = await _send_whatsapp(to_whatsapp_jid(delegation.contact), message)
+    ok, err, _delivery_status, _message_id = await _send_whatsapp(to_whatsapp_jid(delegation.contact), message)
     if not ok:
         return _tool_error(f"Failed to send message: {err}")
     _record_owner_note_in_transcript(
@@ -499,7 +500,7 @@ async def _tool_ask_owner(args: dict, **_kwargs) -> str:
         return _tool_error("No active delegated conversation for this session.")
 
     get_store().set_pending_question(delegation.id, question)
-    ok, err, _delivery_status = await _send_whatsapp(
+    ok, err, _delivery_status, _message_id = await _send_whatsapp(
         delegation.owner_chat_id,
         f"🤝 Delegated conversation ({delegation.objective}) needs your input:\n{question}",
     )
@@ -519,7 +520,7 @@ async def _tool_notify_owner_progress(args: dict, **_kwargs) -> str:
     if delegation is None:
         return _tool_error("No active delegated conversation for this session.")
 
-    ok, err, _delivery_status = await _send_whatsapp(
+    ok, err, _delivery_status, _message_id = await _send_whatsapp(
         delegation.owner_chat_id,
         f"ℹ️ Update on delegated conversation ({delegation.objective}):\n{update}",
     )
@@ -537,7 +538,7 @@ async def _tool_report_delegated_conversation_result(args: dict, **_kwargs) -> s
     if delegation is None:
         return _tool_error("No active delegated conversation for this session.")
 
-    ok, err, _delivery_status = await _send_whatsapp(
+    ok, err, _delivery_status, _message_id = await _send_whatsapp(
         delegation.owner_chat_id,
         f"✅ Delegated conversation finished ({outcome}): {delegation.objective}\n{summary}",
     )
