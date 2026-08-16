@@ -728,13 +728,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             _kill_port_process(self._bridge_port)
             await asyncio.sleep(1)
             
-            # Start the bridge process in its own process group.
-            # Route output to a log file so QR codes, errors, and reconnection
-            # messages are preserved for troubleshooting.
+            # Start the bridge process in its own process group.  Inherit the
+            # gateway's stdout/stderr so structured bridge diagnostics are
+            # visible to container log collection as well as local operators.
             whatsapp_mode = _wenv("WHATSAPP_MODE", "self-chat")
-            self._bridge_log = self._session_path.parent / "bridge.log"
-            bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")
-            self._bridge_log_fh = bridge_log_fh
+            self._bridge_log = None
 
             # Build bridge subprocess environment.
             # Pass WHATSAPP_REPLY_PREFIX from config.yaml so the Node bridge
@@ -791,8 +789,6 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     "--session", str(self._session_path),
                     "--mode", whatsapp_mode,
                 ],
-                stdout=bridge_log_fh,
-                stderr=bridge_log_fh,
                 env=bridge_env,
                 **windows_detach_popen_kwargs(),
             )
@@ -808,7 +804,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 await asyncio.sleep(1)
                 if self._bridge_process.poll() is not None:
                     print(f"[{self.name}] Bridge process died (exit code {self._bridge_process.returncode})")
-                    print(f"[{self.name}] Check log: {self._bridge_log}")
+                    print(f"[{self.name}] Check gateway stdout/stderr for bridge diagnostics")
                     self._close_bridge_log()
                     return False
                 try:
@@ -828,7 +824,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
             if not http_ready:
                 print(f"[{self.name}] Bridge HTTP server did not start in 15s")
-                print(f"[{self.name}] Check log: {self._bridge_log}")
+                print(f"[{self.name}] Check gateway stdout/stderr for bridge diagnostics")
                 self._close_bridge_log()
                 return False
             
@@ -840,7 +836,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     await asyncio.sleep(1)
                     if self._bridge_process.poll() is not None:
                         print(f"[{self.name}] Bridge process died during connection")
-                        print(f"[{self.name}] Check log: {self._bridge_log}")
+                        print(f"[{self.name}] Check gateway stdout/stderr for bridge diagnostics")
                         self._close_bridge_log()
                         return False
                     try:
@@ -860,7 +856,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     # Still not connected — warn but proceed (bridge may
                     # auto-reconnect later, e.g. after a code 515 restart).
                     print(f"[{self.name}] ⚠ WhatsApp not connected after 30s")
-                    print(f"[{self.name}]   Bridge log: {self._bridge_log}")
+                    print(f"[{self.name}]   Check gateway stdout/stderr for bridge diagnostics")
                     print(f"[{self.name}]   If session expired, re-pair: hermes whatsapp")
             
             # Create a persistent HTTP session for all bridge communication
