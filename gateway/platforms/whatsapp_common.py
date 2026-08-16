@@ -508,12 +508,130 @@ def resolve_whatsapp_bridge_dir() -> Path:
 
     When the install tree is read-only (e.g., Docker /opt/hermes), this function
     mirrors the bridge source to a writable HERMES_HOME location and returns that
-    path. This ensures npm install works in Docker environments.
+    path. This ensures npm install works in Docker environments.  The mirror is
+    refreshed when its source revision changes, while leaving ``node_modules``
+    and the separately configured WhatsApp session directory untouched.
 
     Returns the resolved bridge directory path.
     """
+    import hashlib
     import shutil
+    import tempfile
     from pathlib import Path as _Path
+
+    manifest_name = ".hermes-bridge-source-manifest.json"
+    excluded_parts = {
+        "node_modules", ".git", "auth", "credentials", "session", "sessions",
+    }
+    protected_filenames = {
+        ".env", "auth.json", "credentials.json", "creds.json", "secrets.json", "token.json",
+    }
+
+    def is_safe_source_relative(relative: object) -> bool:
+        """True for a manifest path that cannot refer to runtime state."""
+        if not isinstance(relative, str):
+            return False
+        path = _Path(relative)
+        return (
+            not path.is_absolute()
+            and path.name not in protected_filenames | {manifest_name}
+            and not path.name.startswith(".env")
+            and not path.name.endswith((".key", ".pem", ".p12", ".pfx"))
+            and not any(part in excluded_parts | {".."} for part in path.parts)
+        )
+
+    def source_files(bridge_dir: _Path) -> list[_Path]:
+        """Return install-tree bridge assets, never runtime package state."""
+        return sorted(
+            (
+                path for path in bridge_dir.rglob("*")
+                if path.is_file()
+                and is_safe_source_relative(path.relative_to(bridge_dir).as_posix())
+                and not any(
+                    part in excluded_parts
+                    for part in path.relative_to(bridge_dir).parts
+                )
+            ),
+            key=lambda path: path.relative_to(bridge_dir).as_posix(),
+        )
+
+    def source_manifest(bridge_dir: _Path) -> tuple[str, list[str]]:
+        """Hash source paths and contents so an image upgrade is detectable."""
+        digest = hashlib.sha256()
+        files = []
+        for path in source_files(bridge_dir):
+            relative = path.relative_to(bridge_dir).as_posix()
+            files.append(relative)
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        return digest.hexdigest(), files
+
+    def read_manifest(bridge_dir: _Path) -> dict:
+        try:
+            with (bridge_dir / manifest_name).open(encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            return manifest if isinstance(manifest, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def atomic_copy(source: _Path, destination: _Path) -> None:
+        """Replace one source asset without ever exposing a partial file."""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".hermes-bridge-", dir=destination.parent)
+        try:
+            with source.open("rb") as input_handle, os.fdopen(fd, "wb") as output_handle:
+                shutil.copyfileobj(input_handle, output_handle)
+            shutil.copymode(source, temporary)
+            os.replace(temporary, destination)
+        except Exception:
+            _Path(temporary).unlink(missing_ok=True)
+            raise
+
+    def write_manifest(bridge_dir: _Path, manifest: dict) -> None:
+        fd, temporary = tempfile.mkstemp(prefix=".hermes-bridge-", dir=bridge_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle, sort_keys=True)
+                handle.write("\n")
+            os.replace(temporary, bridge_dir / manifest_name)
+        except Exception:
+            _Path(temporary).unlink(missing_ok=True)
+            raise
+
+    def refresh_mirror(source: _Path, mirror: _Path) -> None:
+        """Synchronize only source assets, preserving npm and session state.
+
+        Assets are staged in temporary files and atomically replaced.  Copy the
+        entrypoint last so a concurrent launcher sees either the old bridge or
+        a complete new bridge with all of its imports present.
+        """
+        revision, files = source_manifest(source)
+        previous = read_manifest(mirror)
+        if previous.get("revision") == revision:
+            return
+
+        entrypoint = "bridge.js"
+        for relative in sorted((item for item in files if item != entrypoint)):
+            atomic_copy(source / relative, mirror / relative)
+        if entrypoint in files:
+            atomic_copy(source / entrypoint, mirror / entrypoint)
+
+        # Only remove assets that a previous manifest says this resolver copied.
+        # This cannot touch node_modules, credentials, or externally managed
+        # session state; legacy mirrors gain deletion tracking on this refresh.
+        previous_files = previous.get("files", [])
+        if not isinstance(previous_files, list):
+            previous_files = []
+        for relative in previous_files:
+            if is_safe_source_relative(relative) and relative not in files:
+                candidate = mirror / relative
+                if candidate.is_file():
+                    candidate.unlink()
+
+        write_manifest(mirror, {"revision": revision, "files": files})
 
     # Default location in install tree (may be read-only)
     from hermes_constants import get_hermes_home
@@ -535,18 +653,12 @@ def resolve_whatsapp_bridge_dir() -> Path:
     if install_writable:
         return install_bridge
 
-    # Install dir is read-only, mirror to HERMES_HOME if needed
-    if hermes_home_bridge.exists():
-        return hermes_home_bridge
-
-    # Mirror the bridge source to HERMES_HOME
+    # Install dir is read-only, mirror bridge source to HERMES_HOME and refresh
+    # the persisted source after an image upgrade. Runtime state stays in place.
     try:
         hermes_home_bridge.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(
-            install_bridge,
-            hermes_home_bridge,
-            dirs_exist_ok=False,
-        )
+        hermes_home_bridge.mkdir(exist_ok=True)
+        refresh_mirror(install_bridge, hermes_home_bridge)
         return hermes_home_bridge
     except Exception:
         return install_bridge
