@@ -411,6 +411,32 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     _DEFAULT_BRIDGE_DIR = None  # resolved in __init__
     splits_long_messages = True  # send() chunks via truncate_message()
 
+    def _is_dm_intake_allowed(self, sender_id: str) -> bool:
+        """Admit an active delegated contact at the bridge intake boundary.
+
+        The normal policy gate runs before a ``MessageEvent`` exists, while
+        the delegation plugin's ``pre_gateway_dispatch`` hook runs after one
+        has been built.  Keep ordinary policy authoritative, and only make
+        the narrow exception needed for an active delegation.  The lazy
+        store import avoids loading plugin code during adapter discovery;
+        ``get_active_for_contact`` applies the shared phone/LID canonical
+        identity resolution and expires stale grants before returning one.
+        """
+        if super()._is_dm_intake_allowed(sender_id):
+            return True
+        if self._dm_policy != "allowlist":
+            return False
+        try:
+            from plugins.whatsapp_delegation.store import get_store
+
+            return get_store().get_active_for_contact(sender_id) is not None
+        except Exception:
+            logger.debug(
+                "Unable to check WhatsApp delegated-conversation intake",
+                exc_info=True,
+            )
+            return False
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WHATSAPP)
         # Use shared helper for bridge directory resolution (handles read-only install tree)
