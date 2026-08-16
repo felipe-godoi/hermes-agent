@@ -150,6 +150,10 @@ The Baileys bridge saves its session under `~/.hermes/platforms/whatsapp/session
 - The session data includes encryption keys and device credentials
 - **Do not share or commit this session directory** — it grants full access to the WhatsApp account
 
+### Remediating previously exposed bridge logs
+
+Versions before the bridge log-redaction fix could allow verbose Baileys session diagnostics into inherited container logs. Treat affected Docker/Dokploy log retention and exports as exposed: deploy the fixed version, restart the gateway so it starts the new bridge, restrict or delete retained log copies according to your incident policy, and rotate the WhatsApp linked-device session by unlinking it and running `hermes whatsapp` to pair again. Do not paste session files, QR codes, or log excerpts into tickets or source control.
+
 ---
 
 ## Re-pairing
