@@ -52,7 +52,11 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
   assert.equal(attempts, 1);
   assert.equal(logs.length, 1);
-  assert.match(logs[0], /Reconnect failed \(boom\)/);
+  assert.deepEqual(JSON.parse(logs[0]), {
+    event: 'whatsapp-bridge-error', operation: 'reconnect',
+    code: 'bridge_error', name: 'Error', message: 'Bridge operation failed',
+    retry_delay_ms: 5000,
+  });
   assert.equal(timers.length, 2, 'rejection must schedule a retry');
   assert.equal(timers[1].ms, 5000);
 
@@ -85,7 +89,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   await tick();
 
   assert.equal(logs.length, 1);
-  assert.match(logs[0], /sync boom/);
+  assert.equal(JSON.parse(logs[0]).message, 'Bridge operation failed');
   assert.equal(timers.length, 2);
 }
 
@@ -111,8 +115,11 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   );
   assert.equal(await resolveVersion(), null);
   assert.equal(logs.length, 1);
-  assert.match(logs[0], /version fetch timed out/);
-  assert.match(logs[0], /library default/);
+  assert.deepEqual(JSON.parse(logs[0]), {
+    event: 'whatsapp-bridge-error', operation: 'resolve_baileys_version',
+    code: 'bridge_error', name: 'Error', message: 'Bridge operation failed',
+    fallback: 'library_default',
+  });
 }
 
 // After one success, later failures fall back to the cached version.
@@ -130,8 +137,8 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   assert.deepEqual(await resolveVersion(), [2, 3000, 42]);
   assert.deepEqual(await resolveVersion(), [2, 3000, 42]);
   assert.equal(logs.length, 1);
-  assert.match(logs[0], /network down/);
-  assert.match(logs[0], /cached version/);
+  assert.equal(JSON.parse(logs[0]).fallback, 'cached_version');
+  assert.equal(logs[0].includes('network down'), false);
 }
 
 // The losing timeout timer is cleared after a fast success, so the resolver

@@ -1,6 +1,7 @@
 import path from 'path';
 import { mkdirSync, writeFileSync } from 'fs';
 import { randomBytes } from 'crypto';
+import { emitSafeBridgeError, safeBridgeError } from './baileys_logger.js';
 
 export const MIME_MAP = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
@@ -344,7 +345,7 @@ export async function extractBridgeEvent({
       // reuploadRequest recovery half is already wired in bridge.js.)
       mediaFailures.push(type || 'media');
       try {
-        console.warn(`[bridge] failed to download inbound ${type || 'media'}:`, err?.message || err);
+        emitSafeBridgeError(console.warn, 'download_inbound_media', err);
       } catch {}
     }
   };
@@ -586,7 +587,11 @@ export function createReconnectScheduler(startFn, {
       Promise.resolve()
         .then(startFn)
         .catch((err) => {
-          log(`⚠️  Reconnect failed (${err?.message || err}). Retrying in ${Math.round(retryDelayMs / 1000)}s...`);
+          const details = safeBridgeError(err);
+          log(JSON.stringify({
+            event: 'whatsapp-bridge-error', operation: 'reconnect', ...details,
+            retry_delay_ms: Math.max(0, Math.floor(retryDelayMs)),
+          }));
           scheduleReconnect(retryDelayMs);
         });
     }, delayMs);
@@ -617,7 +622,11 @@ export function createVersionResolver(fetchVersionFn, {
       ]);
       cachedVersion = version;
     } catch (err) {
-      log(`⚠️  Baileys version fetch failed (${err?.message || err}); using ${cachedVersion ? 'cached version' : 'library default'}.`);
+      const details = safeBridgeError(err);
+      log(JSON.stringify({
+        event: 'whatsapp-bridge-error', operation: 'resolve_baileys_version', ...details,
+        fallback: cachedVersion ? 'cached_version' : 'library_default',
+      }));
     } finally {
       if (timer) clearTimeout(timer);
     }
