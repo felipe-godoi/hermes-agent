@@ -34,6 +34,7 @@ import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import { delegatedContactTag, evaluateDelegatedInbound } from './delegated_gate.js';
+import { buildIngressTraceEvents } from './ingress_trace.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
@@ -537,6 +538,14 @@ async function startSocket() {
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    // Keep raw ingress diagnostics before the existing type/message drops.
+    // The helper emits only an allowlisted, privacy-safe event shape.
+    if (WHATSAPP_DEBUG) {
+      for (const trace of buildIngressTraceEvents({ messages, type })) {
+        emitDelegationTrace(trace);
+      }
+    }
+
     // In self-chat mode, your own messages commonly arrive as 'append' rather
     // than 'notify'. Accept both and filter agent echo-backs below.
     if (type !== 'notify' && type !== 'append') return;
