@@ -4,12 +4,25 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 
-import { evaluateDelegatedInbound, isDelegatedConversationActive } from './delegated_gate.js';
+import {
+  evaluateDelegatedInbound,
+  evaluateDelegatedDirectInbound,
+  isDelegatedConversationActive,
+} from './delegated_gate.js';
 
 function withSessionDir(fn) {
   const sessionDir = mkdtempSync(path.join(os.tmpdir(), 'hermes-wa-delegation-'));
   try {
     return fn(sessionDir);
+  } finally {
+    rmSync(sessionDir, { recursive: true, force: true });
+  }
+}
+
+async function withSessionDirAsync(fn) {
+  const sessionDir = mkdtempSync(path.join(os.tmpdir(), 'hermes-wa-delegation-'));
+  try {
+    return await fn(sessionDir);
   } finally {
     rmSync(sessionDir, { recursive: true, force: true });
   }
@@ -95,6 +108,111 @@ test('resolves via lid-mapping aliases the same way matchesAllowedUser does', ()
     });
     // Bridge delivers the LID form; the grant was stored under the phone form.
     assert.equal(isDelegatedConversationActive('267383306489914@lid', sessionDir), true);
+  });
+});
+
+test('active delegated direct LID reply resolves through Baileys before the bridge gate', async () => {
+  await withSessionDirAsync(async (sessionDir) => {
+    const phone = '15550000001';
+    const lid = '900000000000001@lid';
+    writeDelegations(sessionDir, {
+      [phone]: { status: 'ACTIVE', expires_at: Date.now() / 1000 + 3600 },
+    });
+
+    const result = await evaluateDelegatedDirectInbound({
+      senderId: lid,
+      chatId: lid,
+      sessionDir,
+      resolveLidToPhone: async candidate => (
+        candidate === lid ? `${phone}@s.whatsapp.net` : null
+      ),
+    });
+
+    assert.deepEqual(result, {
+      active: true,
+      senderId: `${phone}@s.whatsapp.net`,
+    });
+  });
+});
+
+test('unresolved direct LID fails closed even when a delegation exists', async () => {
+  await withSessionDirAsync(async (sessionDir) => {
+    const lid = '900000000000001@lid';
+    writeDelegations(sessionDir, {
+      '15550000001': { status: 'ACTIVE', expires_at: Date.now() / 1000 + 3600 },
+    });
+
+    const result = await evaluateDelegatedDirectInbound({
+      senderId: lid,
+      chatId: lid,
+      sessionDir,
+      resolveLidToPhone: async () => null,
+    });
+
+    assert.deepEqual(result, { active: false, senderId: lid });
+  });
+});
+
+test('mapped direct LID without its own active delegation fails closed', async () => {
+  await withSessionDirAsync(async (sessionDir) => {
+    const phone = '15550000001';
+    const lid = '900000000000001@lid';
+    writeDelegations(sessionDir, {
+      '15550000002': { status: 'ACTIVE', expires_at: Date.now() / 1000 + 3600 },
+    });
+
+    const result = await evaluateDelegatedDirectInbound({
+      senderId: lid,
+      chatId: lid,
+      sessionDir,
+      resolveLidToPhone: async () => `${phone}@s.whatsapp.net`,
+    });
+
+    assert.deepEqual(result, { active: false, senderId: `${phone}@s.whatsapp.net` });
+  });
+});
+
+test('a group LID participant cannot use the delegated direct-message exception', async () => {
+  await withSessionDirAsync(async (sessionDir) => {
+    const phone = '15550000001';
+    const lid = '900000000000001@lid';
+    writeDelegations(sessionDir, {
+      [phone]: { status: 'ACTIVE', expires_at: Date.now() / 1000 + 3600 },
+    });
+
+    const result = await evaluateDelegatedDirectInbound({
+      senderId: lid,
+      chatId: '120363000000000000@g.us',
+      sessionDir,
+      resolveLidToPhone: async () => `${phone}@s.whatsapp.net`,
+    });
+
+    assert.deepEqual(result, { active: false, senderId: lid });
+  });
+});
+
+test('broadcast, newsletter, and status chats cannot use the delegated direct-message exception', async () => {
+  await withSessionDirAsync(async (sessionDir) => {
+    const lid = '900000000000001@lid';
+    writeDelegations(sessionDir, {
+      '15550000001': { status: 'ACTIVE', expires_at: Date.now() / 1000 + 3600 },
+    });
+
+    for (const chatId of ['status@broadcast', '120363000000000000@newsletter', 'news@broadcast']) {
+      let resolverCalled = false;
+      const result = await evaluateDelegatedDirectInbound({
+        senderId: lid,
+        chatId,
+        sessionDir,
+        resolveLidToPhone: async () => {
+          resolverCalled = true;
+          return '15550000001@s.whatsapp.net';
+        },
+      });
+
+      assert.deepEqual(result, { active: false, senderId: lid });
+      assert.equal(resolverCalled, false);
+    }
   });
 });
 
