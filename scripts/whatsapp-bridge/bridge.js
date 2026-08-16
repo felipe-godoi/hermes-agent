@@ -22,7 +22,6 @@
 import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
-import pino from 'pino';
 import path from 'path';
 import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -36,6 +35,7 @@ import { buildOutboundSendTrace, createOutboundTraceTracker, maskOutboundTarget 
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import { delegatedContactTag, evaluateDelegatedInbound } from './delegated_gate.js';
 import { buildIngressTraceEvents } from './ingress_trace.js';
+import { createSilentBaileysLogger, emitSafeBridgeError, safeBridgeError } from './baileys_logger.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
@@ -276,7 +276,10 @@ function buildLidMap() {
 }
 let lidToPhone = buildLidMap();
 
-const logger = pino({ level: 'warn' });
+// Never allow Baileys to write its records to inherited Docker stdout/stderr.
+// Signal session records can contain cryptographic material even at non-debug
+// levels; bridge-owned lifecycle and allowlisted trace events remain below.
+const logger = createSilentBaileysLogger();
 
 // Message queue for polling
 const messageQueue = [];
@@ -535,7 +538,7 @@ async function startSocket() {
           });
         }
       } catch (err) {
-        console.warn('[bridge] failed to aggregate poll update:', err.message);
+        emitSafeBridgeError(console.warn, 'aggregate_poll_update', err);
       }
       const selectedOptions = normalizePollUpdateOptions(aggregation, pollUpdates?.[0]);
       logPollUpdateDiagnostic({
@@ -744,7 +747,7 @@ async function startSocket() {
             });
           }
         } catch (err) {
-          console.warn('[bridge] failed to aggregate poll upsert:', err.message);
+          emitSafeBridgeError(console.warn, 'aggregate_poll_upsert', err);
         }
         const selectedOptions = normalizePollUpdateOptions(aggregation, pollUpdates[0]);
         logPollUpdateDiagnostic({
@@ -938,7 +941,7 @@ app.post('/send', async (req, res) => {
       elapsed_ms: Math.max(0, Date.now() - startedAt),
       connection_state: connectionState,
     }));
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeBridgeError(err).message });
   }
 });
 
@@ -972,7 +975,7 @@ app.post('/edit', async (req, res) => {
 
     res.json({ success: true, messageIds });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeBridgeError(err).message });
   }
 });
 
@@ -1019,7 +1022,7 @@ app.post('/send-media', async (req, res) => {
               gifPlayback: true,
             };
           } catch (gifErr) {
-            console.warn('[bridge] gif conversion failed, sending as image/gif:', gifErr.message);
+            emitSafeBridgeError(console.warn, 'gif_conversion', gifErr);
             msgPayload = mediaPayloadForFile({ buffer, filePath, mediaType: type, caption, fileName });
           } finally {
             try { if (tmpGifMp4 && existsSync(tmpGifMp4)) unlinkSync(tmpGifMp4); } catch (_) {}
@@ -1051,7 +1054,7 @@ app.post('/send-media', async (req, res) => {
             audioExt = 'ogg';
           } catch (convErr) {
             // ffmpeg not available or conversion failed — fall back to original format
-            console.warn('[bridge] ffmpeg conversion failed, sending as file attachment:', convErr.message);
+            emitSafeBridgeError(console.warn, 'audio_conversion', convErr);
           } finally {
             try { if (tmpPath && existsSync(tmpPath)) unlinkSync(tmpPath); } catch (_) {}
           }
@@ -1071,7 +1074,7 @@ app.post('/send-media', async (req, res) => {
     messageStore.remember(sent);
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeBridgeError(err).message });
   }
 });
 
@@ -1095,7 +1098,7 @@ app.post('/send-poll', async (req, res) => {
     rememberSentMessage(sent, payload);
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(400).json({ error: safeBridgeError(err).message });
   }
 });
 
@@ -1117,7 +1120,7 @@ app.post('/send-location', async (req, res) => {
     messageStore.remember(sent);
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(400).json({ error: safeBridgeError(err).message });
   }
 });
 
@@ -1157,7 +1160,7 @@ app.post('/read', async (req, res) => {
     await sock.readMessages(receiptKeys);
     return res.json({ success: true, marked: true });
   } catch (err) {
-    console.warn('[bridge] failed to send read receipt:', err.message);
+    emitSafeBridgeError(console.warn, 'send_read_receipt', err);
     return res.status(500).json({ error: 'Failed to send read receipt' });
   }
 });
@@ -1209,9 +1212,9 @@ if (PAIR_ONLY) {
     console.log();
   }
   startSocket().catch((err) => {
-    emitPairEvent({ event: 'error', error: err?.message || String(err) });
+    emitPairEvent({ event: 'error', ...safeBridgeError(err) });
     if (!PAIR_JSON) {
-      console.error(err);
+      emitSafeBridgeError(console.error, 'pairing', err);
     }
     process.exit(1);
   });
