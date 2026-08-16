@@ -33,6 +33,7 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { isDelegatedConversationActive } from './delegated_gate.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
@@ -646,7 +647,16 @@ async function startSocket() {
           } catch {}
           continue;
         }
-        if (WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+        if (
+          WHATSAPP_DM_POLICY !== 'pairing' &&
+          !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR) &&
+          // Not on the allowlist -- but forward anyway if an owner-granted,
+          // TTL-bound delegated conversation is active for this exact
+          // sender (see plugins/whatsapp_delegation). This never widens
+          // ALLOWED_USERS itself: it's a second, independent, narrower gate
+          // that only ever admits ONE contact for the grant's TTL window.
+          !isDelegatedConversationActive(senderId, SESSION_DIR)
+        ) {
           try {
             console.log(JSON.stringify({
               event: 'ignored',
