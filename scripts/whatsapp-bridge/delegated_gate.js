@@ -65,12 +65,13 @@ function canonicalPhoneJid(value) {
  * Resolve the narrow delegated-DM exception before the bridge's ordinary
  * allowlist drop. Baileys owns the LID↔PN mapping: `getPNForLID` reads its
  * authenticated key state and returns null when it has no verified reverse
- * mapping. We fail closed for every other chat shape and resolver result.
+ * mapping. When that best-effort lookup is absent, the active-delegation
+ * check can use the same persisted aliases as the Python boundary. We fail
+ * closed for every other chat shape and resolver result.
  *
- * The returned senderId is deliberately the canonical PN JID while callers
- * retain the original chatId. This lets the adapter's intake/delegation path
- * associate the message with the phone-keyed grant without changing the
- * Baileys reply route for the LID chat.
+ * The returned senderId is the canonical PN JID when available. For an
+ * admitted persisted LID alias it remains the original LID, preserving the
+ * reply route while the downstream identity boundary resolves that alias.
  */
 export async function evaluateDelegatedDirectInbound({
   senderId,
@@ -94,7 +95,10 @@ export async function evaluateDelegatedDirectInbound({
     }
   }
   if (!resolvedSenderId) {
-    return { active: false, senderId: originalSenderId };
+    return {
+      active: isDelegatedConversationActive(originalSenderId, sessionDir, now),
+      senderId: originalSenderId,
+    };
   }
 
   return {

@@ -690,8 +690,9 @@ async function startSocket() {
         // Not on the allowlist -- but forward anyway if an owner-granted,
         // TTL-bound delegated conversation is active for this exact sender.
         // For a third-party direct LID, ask Baileys' authenticated mapping
-        // state for its canonical phone first; arbitrary/unresolved LIDs fail
-        // closed. This trace is deliberately limited to this narrow exception.
+        // state for its canonical phone first. If its best-effort reverse
+        // mapping is unavailable, only an active persisted alias grant admits
+        // the LID. This trace is deliberately limited to this narrow exception.
         if (unlistedNonPairingDm) {
           const delegatedResolution = await evaluateDelegatedDirectInbound({
             senderId,
@@ -706,9 +707,9 @@ async function startSocket() {
               messageId: msg.key.id,
               emit: emitDelegationTrace,
             });
-            // Preserve the original LID chatId for replies, but forward the
-            // verified phone identity so adapter/delegation lookup reaches
-            // the same phone-keyed active grant.
+            // Preserve the original LID chatId for replies. A resolver-backed
+            // canonical phone is forwarded when available; otherwise the
+            // Python boundary resolves the active persisted LID alias.
             if (delegatedInbound) {
               senderId = delegatedResolution.senderId;
               senderNumber = senderId.replace(/@.*/, '');
