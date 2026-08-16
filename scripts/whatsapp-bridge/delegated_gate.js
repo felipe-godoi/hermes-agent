@@ -1,7 +1,7 @@
 import path from 'path';
 import { existsSync, readFileSync } from 'fs';
 
-import { expandWhatsAppIdentifiers } from './allowlist.js';
+import { expandWhatsAppIdentifiers, normalizeWhatsAppIdentifier } from './allowlist.js';
 
 /**
  * Pure check: does an active, unexpired delegated-conversation grant cover
@@ -22,9 +22,7 @@ import { expandWhatsAppIdentifiers } from './allowlist.js';
  */
 export function isDelegatedConversationActive(senderId, sessionDir, now = Date.now() / 1000) {
   const filePath = path.join(sessionDir, 'delegated-conversations.json');
-  if (!existsSync(filePath)) {
-    return false;
-  }
+  if (!existsSync(filePath)) return false;
 
   let data;
   try {
@@ -36,8 +34,7 @@ export function isDelegatedConversationActive(senderId, sessionDir, now = Date.n
     return false;
   }
 
-  const aliases = expandWhatsAppIdentifiers(senderId, sessionDir);
-  for (const alias of aliases) {
+  for (const alias of expandWhatsAppIdentifiers(senderId, sessionDir)) {
     const record = data[alias];
     if (
       record &&
@@ -49,6 +46,18 @@ export function isDelegatedConversationActive(senderId, sessionDir, now = Date.n
     }
   }
   return false;
+}
+
+/**
+ * Whether the persisted multi-file alias state relates this identifier to a
+ * different alias. This reuses the allowlist's read-only mapping traversal;
+ * callers receive only a boolean, never a path or identifier.
+ */
+export function hasPersistedWhatsAppAlias(identifier, sessionDir) {
+  const normalized = normalizeWhatsAppIdentifier(identifier);
+  if (!normalized) return false;
+  return [...expandWhatsAppIdentifiers(identifier, sessionDir)]
+    .some((alias) => alias !== normalized);
 }
 
 function isDirectWhatsAppChat(chatId) {
@@ -78,6 +87,7 @@ export async function evaluateDelegatedDirectInbound({
   chatId,
   sessionDir,
   resolveLidToPhone,
+  mappingStorePresent = false,
   now,
 }) {
   const originalSenderId = String(senderId || '').trim();
@@ -86,6 +96,8 @@ export async function evaluateDelegatedDirectInbound({
   }
 
   let resolvedSenderId = canonicalPhoneJid(originalSenderId);
+  const isDirectLid = originalSenderId.endsWith('@lid');
+  const resolverPresent = typeof resolveLidToPhone === 'function';
   if (originalSenderId.endsWith('@lid')) {
     try {
       resolvedSenderId = canonicalPhoneJid(await resolveLidToPhone?.(originalSenderId));
@@ -94,16 +106,25 @@ export async function evaluateDelegatedDirectInbound({
       // not turn an identity-resolution failure into an admission.
     }
   }
-  if (!resolvedSenderId) {
-    return {
-      active: isDelegatedConversationActive(originalSenderId, sessionDir, now),
-      senderId: originalSenderId,
-    };
-  }
-
+  const delegatedSenderId = resolvedSenderId || originalSenderId;
+  // Preserve the pre-diagnostic resolver/fallback admission semantics: use
+  // the resolver's canonical PN when it returned one; otherwise use the
+  // original LID and its persisted aliases.
+  const active = isDelegatedConversationActive(delegatedSenderId, sessionDir, now);
   return {
-    active: isDelegatedConversationActive(resolvedSenderId, sessionDir, now),
-    senderId: resolvedSenderId,
+    active,
+    senderId: delegatedSenderId,
+    ...(isDirectLid ? {
+      diagnostic: {
+        event: 'whatsapp_delegated_direct_lid_diagnostic',
+        mapping_store_present: Boolean(mappingStorePresent),
+        resolver_present: resolverPresent,
+        resolver_returned_value: Boolean(resolvedSenderId),
+        persisted_alias_present: hasPersistedWhatsAppAlias(originalSenderId, sessionDir),
+        active_delegation_alias_match: active,
+        outcome: active ? 'forwarded' : 'dropped',
+      },
+    } : {}),
   };
 }
 
@@ -121,11 +142,22 @@ export function delegatedContactTag(senderId) {
 }
 
 /**
- * Evaluate the narrow delegated-contact exception and emit only safe trace
- * fields. Kept pure so the bridge policy and its observability stay testable
- * without loading the Baileys socket.
+ * Emit the established delegated-contact trace pair. This remains separate
+ * from the direct-LID diagnostic, whose schema intentionally has no IDs.
  */
-export function evaluateDelegatedInbound({ senderId, sessionDir, messageId, emit = () => {}, now }) {
+export function evaluateDelegatedInbound({
+  senderId,
+  sessionDir,
+  messageId,
+  emit = () => {},
+  now,
+  emitLegacyTraces = true,
+}) {
+  const active = isDelegatedConversationActive(senderId, sessionDir, now);
+  // A direct-LID attempt has one intentionally identifier-free diagnostic.
+  // Do not add the older contact/message trace pair to that same attempt.
+  if (!emitLegacyTraces) return active;
+
   const contact = delegatedContactTag(senderId);
   const trace = (stage, extra = {}) => emit({
     event: 'whatsapp-delegation-trace',
@@ -136,10 +168,26 @@ export function evaluateDelegatedInbound({ senderId, sessionDir, messageId, emit
   });
 
   trace('bridge_delegation_exception_received');
-  const active = isDelegatedConversationActive(senderId, sessionDir, now);
   trace('bridge_delegation_lookup', {
     active,
     action: active ? 'forward' : 'drop',
   });
   return active;
+}
+
+/** Emit the legacy enqueue trace unless this is a direct-LID attempt. */
+export function emitDelegatedEnqueuedTrace({
+  senderId,
+  messageId,
+  emit = () => {},
+  emitLegacyTraces = true,
+}) {
+  if (!emitLegacyTraces) return;
+  emit({
+    event: 'whatsapp-delegation-trace',
+    stage: 'bridge_delegation_enqueued',
+    contact: delegatedContactTag(senderId),
+    ...(messageId ? { messageId: String(messageId) } : {}),
+    action: 'forwarded',
+  });
 }
