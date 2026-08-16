@@ -242,6 +242,7 @@ async def test_bridge_intake_admits_only_active_delegated_allowlist_contact(
         "chatId": chat_id,
         "chatName": "Delegated contact",
         "senderName": "Contact",
+        "delegatedInbound": True,
     }
 
     event = await adapter._build_message_event(bridge_data)
@@ -263,7 +264,89 @@ async def test_bridge_intake_admits_only_active_delegated_allowlist_contact(
     bridge_data["senderId"] = "5511999999999@s.whatsapp.net"
     bridge_data["from"] = "5511999999999@s.whatsapp.net"
     bridge_data["chatId"] = "5511999999999@s.whatsapp.net"
+    bridge_data.pop("delegatedInbound")
     assert await adapter._build_message_event(bridge_data) is None
+
+
+@pytest.mark.asyncio
+async def test_delegated_bridge_intake_and_plugin_emit_safe_trace_markers(
+    monkeypatch, tmp_path, delegation_store, caplog
+):
+    """The bridge-marked delegated path is traceable without logging text or JIDs."""
+    import logging
+
+    _clear_auth_env(monkeypatch)
+    delegation_store.create(
+        contact=CONTACT_ID, objective="confirm appointment", ttl_seconds=3600,
+        owner=OWNER_ID, owner_chat_id=OWNER_ID,
+    )
+    adapter = _make_whatsapp_adapter_for_intake()
+    adapter.name = "whatsapp"
+    bridge_data = {
+        "isGroup": False,
+        "body": "private reply body must never appear in logs",
+        "messageId": "safe-message-id",
+        "senderId": CONTACT_ID,
+        "from": CONTACT_ID,
+        "chatId": CONTACT_ID,
+        "delegatedInbound": True,
+    }
+
+    with caplog.at_level(logging.INFO):
+        event = await adapter._build_message_event(bridge_data)
+        assert event is not None
+        assert _on_pre_gateway_dispatch(event=event) == {"action": "delegate"}
+
+    trace_lines = [record.getMessage() for record in caplog.records if "whatsapp-delegation-trace" in record.getMessage()]
+    assert [line.split(" stage=", 1)[1].split(" ", 1)[0] for line in trace_lines] == [
+        "adapter_bridge_message_received",
+        "adapter_event_built",
+        "plugin_delegation_lookup",
+    ]
+    joined = "\n".join(trace_lines)
+    assert "private reply body" not in joined
+    assert CONTACT_ID not in joined
+    assert "jid:…9595" in joined
+    assert "message_id=safe-message-id" in joined
+
+
+@pytest.mark.asyncio
+async def test_non_delegated_bridge_intake_remains_trace_quiet(
+    monkeypatch, delegation_store, caplog
+):
+    """Ordinary rejected intake is unchanged and does not produce trace noise."""
+    import logging
+
+    _clear_auth_env(monkeypatch)
+    adapter = _make_whatsapp_adapter_for_intake()
+    adapter.name = "whatsapp"
+    data = {
+        "isGroup": False,
+        "body": "ordinary unlisted message",
+        "messageId": "ordinary-message-id",
+        "senderId": "5511999999999@s.whatsapp.net",
+        "chatId": "5511999999999@s.whatsapp.net",
+    }
+    with caplog.at_level(logging.INFO):
+        assert await adapter._build_message_event(data) is None
+    assert not [record for record in caplog.records if "whatsapp-delegation-trace" in record.getMessage()]
+
+
+def test_plugin_traces_expired_bridge_marked_delegation_as_normal_dispatch(
+    delegation_store, caplog
+):
+    """A grant expiring between bridge and hook is diagnosed without admission."""
+    import logging
+
+    event = _make_event("5511999999999@s.whatsapp.net")
+    event.raw_message = {"delegatedInbound": True}
+    with caplog.at_level(logging.INFO):
+        assert _on_pre_gateway_dispatch(event=event) is None
+    trace_lines = [record.getMessage() for record in caplog.records if "whatsapp-delegation-trace" in record.getMessage()]
+    assert trace_lines == [
+        "whatsapp-delegation-trace stage=plugin_delegation_lookup "
+        "contact=jid:…9999 message_id=m1 active=false action=continue_normal_dispatch"
+    ]
 
 
 @pytest.mark.asyncio

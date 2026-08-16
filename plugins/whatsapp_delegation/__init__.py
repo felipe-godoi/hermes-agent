@@ -56,6 +56,16 @@ _DELEGATED_TOOL_ALLOWLIST = frozenset(
 )
 
 
+def _delegation_contact_tag(value: str) -> str:
+    """Return a safe, stable contact tag for delegation diagnostics only."""
+    raw = str(value or "").strip()
+    user, _, domain = raw.partition("@")
+    digits = "".join(char for char in user if char.isdigit())
+    suffix = (digits or user)[-4:] or "unknown"
+    kind = "lid" if domain == "lid" else "jid" if domain else "unknown"
+    return f"{kind}:…{suffix}"
+
+
 # --------------------------------------------------------------------------
 # Small internal helpers shared by hooks and tool handlers
 # --------------------------------------------------------------------------
@@ -226,15 +236,25 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **_kw
         return None
 
     delegation = get_store().get_active_for_contact(source.chat_id or source.user_id or "")
+    raw_message = getattr(event, "raw_message", None)
+    trace_inbound = isinstance(raw_message, dict) and raw_message.get("delegatedInbound") is True
+    message_id = getattr(event, "message_id", None) or "-"
+    contact = _delegation_contact_tag(source.chat_id or source.user_id or "")
     if delegation is None:
+        if trace_inbound:
+            logger.info(
+                "whatsapp-delegation-trace stage=plugin_delegation_lookup "
+                "contact=%s message_id=%s active=false action=continue_normal_dispatch",
+                contact, message_id,
+            )
         return None
 
-    logger.info(
-        "whatsapp-delegation: admitting message from delegated contact "
-        "conversation_id=%s (owner=%s)",
-        delegation.id,
-        delegation.owner,
-    )
+    if trace_inbound:
+        logger.info(
+            "whatsapp-delegation-trace stage=plugin_delegation_lookup "
+            "contact=%s message_id=%s active=true action=delegate",
+            contact, message_id,
+        )
     return {"action": "delegate"}
 
 

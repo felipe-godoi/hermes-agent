@@ -33,7 +33,7 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
-import { isDelegatedConversationActive } from './delegated_gate.js';
+import { delegatedContactTag, evaluateDelegatedInbound } from './delegated_gate.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
@@ -223,6 +223,12 @@ function emitDebugEvent(payload) {
   if (!WHATSAPP_DEBUG) return;
   try {
     console.log(JSON.stringify({ event: 'debug', ...payload }));
+  } catch {}
+}
+
+function emitDelegationTrace(payload) {
+  try {
+    console.log(JSON.stringify(payload));
   } catch {}
 }
 
@@ -635,6 +641,7 @@ async function startSocket() {
       // themselves — stranger DMs / group pings must never reach the
       // Python gateway, otherwise a pairing-code reply fires in response
       // to arbitrary incoming messages (#8389).
+      let delegatedInbound = false;
       if (!msg.key.fromMe) {
         if (WHATSAPP_MODE === 'self-chat') {
           try {
@@ -647,22 +654,24 @@ async function startSocket() {
           } catch {}
           continue;
         }
-        if (
+        const unlistedNonPairingDm =
           WHATSAPP_DM_POLICY !== 'pairing' &&
-          !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR) &&
-          // Not on the allowlist -- but forward anyway if an owner-granted,
-          // TTL-bound delegated conversation is active for this exact
-          // sender (see plugins/whatsapp_delegation). This never widens
-          // ALLOWED_USERS itself: it's a second, independent, narrower gate
-          // that only ever admits ONE contact for the grant's TTL window.
-          !isDelegatedConversationActive(senderId, SESSION_DIR)
-        ) {
+          !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR);
+        // Not on the allowlist -- but forward anyway if an owner-granted,
+        // TTL-bound delegated conversation is active for this exact sender.
+        // This trace is deliberately limited to this narrow exception path.
+        delegatedInbound = unlistedNonPairingDm && evaluateDelegatedInbound({
+          senderId,
+          sessionDir: SESSION_DIR,
+          messageId: msg.key.id,
+          emit: emitDelegationTrace,
+        });
+        if (unlistedNonPairingDm && !delegatedInbound) {
           try {
             console.log(JSON.stringify({
               event: 'ignored',
               reason: 'allowlist_mismatch',
-              chatId,
-              senderId,
+              contact: delegatedContactTag(senderId),
             }));
           } catch {}
           continue;
@@ -744,6 +753,7 @@ async function startSocket() {
         },
       });
       event.fromOwner = fromOwner;
+      event.delegatedInbound = delegatedInbound;
 
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
       if (msg.key.fromMe && ((REPLY_PREFIX && event.body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
@@ -771,6 +781,15 @@ async function startSocket() {
 
       messageStore.remember(msg);
       messageQueue.push(event);
+      if (delegatedInbound) {
+        emitDelegationTrace({
+          event: 'whatsapp-delegation-trace',
+          stage: 'bridge_delegation_enqueued',
+          contact: delegatedContactTag(senderId),
+          messageId: msg.key.id,
+          action: 'forwarded',
+        });
+      }
       emitDebugEvent({
         stage: 'queued',
         chatId: redactWhatsAppId(chatId),
