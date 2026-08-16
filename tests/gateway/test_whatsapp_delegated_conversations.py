@@ -15,6 +15,8 @@ Covers the 7 scenarios called out in the feature brief:
   7. delegated -> nao recebe tools privilegiadas
 """
 
+import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -317,7 +319,10 @@ def _patch_live_gateway(monkeypatch):
     """Fake `_gateway_runner_ref()` returning a runner with a mocked WhatsApp
     adapter.send, the same seam _send_whatsapp uses in production."""
     send_mock = AsyncMock()
-    runner = SimpleNamespace(adapters={Platform.WHATSAPP: SimpleNamespace(send=send_mock)})
+    runner = SimpleNamespace(
+        adapters={Platform.WHATSAPP: SimpleNamespace(send=send_mock)},
+        _gateway_loop=asyncio.get_running_loop(),
+    )
     monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
     return send_mock
 
@@ -428,6 +433,59 @@ async def test_start_delegated_conversation_creates_record_and_sends_opening_mes
     active = delegation_store.get_active_for_contact(CONTACT_ID)
     assert active is not None
     assert active.owner == "15551234567"  # canonicalized form of OWNER_ID
+
+
+@pytest.mark.asyncio
+async def test_start_delegated_conversation_sends_on_gateway_loop_from_worker_thread(
+    monkeypatch, delegation_store
+):
+    """The adapter's aiohttp session belongs to the gateway loop, not the agent worker."""
+    gateway_loop = asyncio.new_event_loop()
+    gateway_ready = threading.Event()
+    gateway_thread = threading.Thread(
+        target=lambda: (asyncio.set_event_loop(gateway_loop), gateway_ready.set(), gateway_loop.run_forever()),
+        daemon=True,
+    )
+    gateway_thread.start()
+    assert gateway_ready.wait(timeout=1)
+
+    sent_on_loop = []
+
+    async def loop_bound_send(*, chat_id, content):
+        if asyncio.get_running_loop() is not gateway_loop:
+            raise RuntimeError("Timeout context manager should be used inside a task")
+        sent_on_loop.append((chat_id, content))
+        return SimpleNamespace(success=True)
+
+    runner = SimpleNamespace(
+        adapters={Platform.WHATSAPP: SimpleNamespace(send=loop_bound_send)},
+        _gateway_loop=gateway_loop,
+    )
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": {
+            "HERMES_SESSION_PLATFORM": "whatsapp",
+            "HERMES_SESSION_USER_ID": OWNER_ID,
+            "HERMES_SESSION_CHAT_ID": OWNER_ID,
+        }.get(name, default),
+    )
+
+    try:
+        result = await asyncio.to_thread(
+            lambda: asyncio.run(
+                _tool_start_delegated_conversation(
+                    {"contact": CONTACT_ID, "objective": "obj", "opening_message": "hello"}
+                )
+            )
+        )
+    finally:
+        gateway_loop.call_soon_threadsafe(gateway_loop.stop)
+        gateway_thread.join(timeout=1)
+        gateway_loop.close()
+
+    assert '"success": true' in result
+    assert sent_on_loop == [(CONTACT_ID, "hello")]
 
 
 @pytest.mark.asyncio
