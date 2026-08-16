@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 
-import { isDelegatedConversationActive } from './delegated_gate.js';
+import { evaluateDelegatedInbound, isDelegatedConversationActive } from './delegated_gate.js';
 
 function withSessionDir(fn) {
   const sessionDir = mkdtempSync(path.join(os.tmpdir(), 'hermes-wa-delegation-'));
@@ -40,6 +40,31 @@ test('active, unexpired delegation -> active', () => {
       '19175395595': { status: 'ACTIVE', expires_at: Date.now() / 1000 + 3600 },
     });
     assert.equal(isDelegatedConversationActive('19175395595@s.whatsapp.net', sessionDir), true);
+  });
+});
+
+test('delegated exception emits only safe trace markers and forwards active contact', () => {
+  withSessionDir((sessionDir) => {
+    writeDelegations(sessionDir, {
+      '19175395595': { status: 'ACTIVE', expires_at: Date.now() / 1000 + 3600 },
+    });
+    const traces = [];
+    const active = evaluateDelegatedInbound({
+      senderId: '19175395595@s.whatsapp.net',
+      sessionDir,
+      messageId: 'safe-message-id',
+      emit: trace => traces.push(trace),
+    });
+
+    assert.equal(active, true);
+    assert.deepEqual(traces.map(trace => trace.stage), [
+      'bridge_delegation_exception_received',
+      'bridge_delegation_lookup',
+    ]);
+    assert.equal(traces[1].active, true);
+    assert.equal(traces[1].action, 'forward');
+    assert.equal(traces[0].contact, 'jid:…9595');
+    assert.equal(JSON.stringify(traces).includes('19175395595'), false);
   });
 });
 

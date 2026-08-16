@@ -50,3 +50,40 @@ export function isDelegatedConversationActive(senderId, sessionDir, now = Date.n
   }
   return false;
 }
+
+/**
+ * Safe, stable identifier for delegation diagnostics.  Do not use this for
+ * routing: it intentionally retains only the final four digits and JID kind.
+ */
+export function delegatedContactTag(senderId) {
+  const raw = String(senderId || '').trim();
+  const [userPart = '', domainPart = ''] = raw.split('@', 2);
+  const digits = userPart.replace(/\D/g, '');
+  const suffix = digits ? digits.slice(-4) : userPart.slice(-4);
+  const kind = domainPart === 'lid' ? 'lid' : domainPart ? 'jid' : 'unknown';
+  return `${kind}:…${suffix || 'unknown'}`;
+}
+
+/**
+ * Evaluate the narrow delegated-contact exception and emit only safe trace
+ * fields. Kept pure so the bridge policy and its observability stay testable
+ * without loading the Baileys socket.
+ */
+export function evaluateDelegatedInbound({ senderId, sessionDir, messageId, emit = () => {}, now }) {
+  const contact = delegatedContactTag(senderId);
+  const trace = (stage, extra = {}) => emit({
+    event: 'whatsapp-delegation-trace',
+    stage,
+    contact,
+    ...(messageId ? { messageId: String(messageId) } : {}),
+    ...extra,
+  });
+
+  trace('bridge_delegation_exception_received');
+  const active = isDelegatedConversationActive(senderId, sessionDir, now);
+  trace('bridge_delegation_lookup', {
+    active,
+    action: active ? 'forward' : 'drop',
+  });
+  return active;
+}

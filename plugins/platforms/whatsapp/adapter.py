@@ -62,6 +62,31 @@ logger = logging.getLogger(__name__)
 _OWNER_REPLY_PREFIX = "[owner reply] "
 
 
+def _delegation_contact_tag(data: Dict[str, Any]) -> str:
+    """Return a safe, stable tag for delegation diagnostics only."""
+    raw = str(data.get("senderId") or data.get("from") or "").strip()
+    user, _, domain = raw.partition("@")
+    digits = "".join(char for char in user if char.isdigit())
+    suffix = (digits or user)[-4:] or "unknown"
+    kind = "lid" if domain == "lid" else "jid" if domain else "unknown"
+    return f"{kind}:…{suffix}"
+
+
+def _delegation_trace(adapter_name: str, stage: str, data: Dict[str, Any], **fields: Any) -> None:
+    """Log only bridge-marked delegated inbound flow; never log message content."""
+    if not data.get("delegatedInbound"):
+        return
+    message_id = data.get("messageId")
+    logger.info(
+        "whatsapp-delegation-trace stage=%s adapter=%s contact=%s message_id=%s %s",
+        stage,
+        adapter_name,
+        _delegation_contact_tag(data),
+        str(message_id) if message_id else "-",
+        " ".join(f"{key}={value}" for key, value in fields.items()),
+    )
+
+
 def _listener_pids_on_port(port: int) -> list:
     """PIDs of processes *listening* on ``port`` (POSIX) — never clients.
 
@@ -1499,7 +1524,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
         try:
+            adapter_name = getattr(self, "name", "whatsapp")
+            _delegation_trace(adapter_name, "adapter_bridge_message_received", data)
             if not self._should_process_message(data):
+                _delegation_trace(adapter_name, "adapter_early_gate", data, action="drop")
                 return None
 
             # Determine message type
@@ -1680,7 +1708,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 if not body.startswith(_OWNER_REPLY_PREFIX):
                     body = f"{_OWNER_REPLY_PREFIX}{body}"
 
-            return MessageEvent(
+            event = MessageEvent(
                 text=body,
                 message_type=msg_type,
                 source=source,
@@ -1694,6 +1722,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 reply_to_author_id=reply_to_author_id,
                 reply_to_is_own_message=reply_to_is_own_message,
             )
+            _delegation_trace(adapter_name, "adapter_event_built", data, action="build")
+            return event
         except Exception as e:
             print(f"[{self.name}] Error building event: {e}")
             return None
