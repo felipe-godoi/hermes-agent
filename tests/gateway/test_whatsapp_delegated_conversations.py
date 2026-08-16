@@ -16,6 +16,7 @@ Covers the 7 scenarios called out in the feature brief:
 """
 
 import asyncio
+import json
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -72,6 +73,34 @@ def _make_event(sender: str, text: str = "hello") -> MessageEvent:
             user_name="tester",
             chat_type="dm",
         ),
+    )
+
+
+def _make_whatsapp_adapter_for_intake():
+    """Construct only the state the real bridge intake path needs."""
+    from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter.platform = Platform.WHATSAPP
+    adapter.config = PlatformConfig(
+        enabled=True,
+        extra={"dm_policy": "allowlist", "allow_from": [OWNER_ID]},
+    )
+    adapter._dm_policy = "allowlist"
+    adapter._allow_from = {OWNER_ID}
+    return adapter
+
+
+def _write_lid_mapping(monkeypatch, tmp_path, *, phone: str, lid: str) -> None:
+    """Make the shared identity resolver see the bridge's phone/LID mapping."""
+    monkeypatch.setattr(
+        "gateway.whatsapp_identity.get_hermes_dir", lambda *_args: tmp_path
+    )
+    (tmp_path / f"lid-mapping-{phone}.json").write_text(
+        json.dumps(lid), encoding="utf-8"
+    )
+    (tmp_path / f"lid-mapping-{lid}_reverse.json").write_text(
+        json.dumps(phone), encoding="utf-8"
     )
 
 
@@ -171,6 +200,70 @@ async def test_active_delegation_admits_message(monkeypatch, delegation_store):
 
     await runner._handle_message(_make_event(CONTACT_ID))
     assert dispatched["called"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sender_id,chat_id",
+    [
+        ("553484269133@s.whatsapp.net", "553484269133@s.whatsapp.net"),
+        ("77214955630717@lid", "77214955630717@lid"),
+    ],
+)
+async def test_bridge_intake_admits_only_active_delegated_allowlist_contact(
+    monkeypatch, tmp_path, delegation_store, sender_id, chat_id
+):
+    """The bridge adapter must build an event before the plugin hook can admit it.
+
+    The owner is the sole normal allowlist entry.  Both bridge-shaped phone
+    and mapped-LID deliveries must reach the existing restricted dispatch
+    toolset; an unrelated unlisted contact remains dropped.
+    """
+    from gateway.run import GatewayRunner
+
+    _clear_auth_env(monkeypatch)
+    _write_lid_mapping(
+        monkeypatch, tmp_path, phone="553484269133", lid="77214955630717"
+    )
+    delegation_store.create(
+        contact="+55 34 8426-9133",
+        objective="confirm appointment",
+        ttl_seconds=3600,
+        owner=OWNER_ID,
+        owner_chat_id=OWNER_ID,
+    )
+    adapter = _make_whatsapp_adapter_for_intake()
+    bridge_data = {
+        "isGroup": False,
+        "body": "hello",
+        "messageId": "bridge-message-1",
+        "senderId": sender_id,
+        "from": sender_id,
+        "chatId": chat_id,
+        "chatName": "Delegated contact",
+        "senderName": "Contact",
+    }
+
+    event = await adapter._build_message_event(bridge_data)
+
+    assert event is not None
+    assert event.source.chat_id == chat_id
+    runner = object.__new__(GatewayRunner)
+    runner._adapter_for_source = lambda _source: adapter
+    enabled_toolsets = GatewayRunner._resolve_enabled_toolsets_for_source(
+        runner,
+        {"platform_toolsets": {"whatsapp": ["terminal", "file"]}},
+        event.source,
+        "whatsapp",
+    )
+    assert DELEGATED_TOOLSET in enabled_toolsets
+    assert "terminal" not in enabled_toolsets
+    assert "file" not in enabled_toolsets
+
+    bridge_data["senderId"] = "5511999999999@s.whatsapp.net"
+    bridge_data["from"] = "5511999999999@s.whatsapp.net"
+    bridge_data["chatId"] = "5511999999999@s.whatsapp.net"
+    assert await adapter._build_message_event(bridge_data) is None
 
 
 @pytest.mark.asyncio
