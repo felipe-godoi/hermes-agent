@@ -36,6 +36,7 @@ Security model (see also ``store.py`` and the ``pre_gateway_dispatch``
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -139,7 +140,25 @@ async def _send_whatsapp(chat_id: str, text: str) -> tuple[bool, Optional[str], 
         adapter = runner.adapters.get(Platform.WHATSAPP)
         if adapter is None:
             return False, "no live WhatsApp adapter", "failed"
-        result = await adapter.send(chat_id=chat_id, content=text)
+        gateway_loop = getattr(runner, "_gateway_loop", None)
+        if gateway_loop is None or gateway_loop.is_closed() or not gateway_loop.is_running():
+            return False, "live gateway loop is unavailable", "failed"
+
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if current_loop is gateway_loop:
+            result = await adapter.send(chat_id=chat_id, content=text)
+        else:
+            send_coro = adapter.send(chat_id=chat_id, content=text)
+            try:
+                future = asyncio.run_coroutine_threadsafe(send_coro, gateway_loop)
+            except Exception:
+                send_coro.close()
+                raise
+            result = await asyncio.wrap_future(future)
         return _send_outcome(result)
     except Exception as exc:  # noqa: BLE001 - surfaced to the caller as a tool error
         logger.warning("whatsapp-delegation: send failed: %s", exc, exc_info=True)
