@@ -135,7 +135,28 @@ test('active delegated direct LID reply resolves through Baileys before the brid
   });
 });
 
-test('unresolved direct LID fails closed even when a delegation exists', async () => {
+test('unresolved direct LID uses persisted aliases for an active phone delegation', async () => {
+  await withSessionDirAsync(async (sessionDir) => {
+    const phone = '15550000001';
+    const lid = '900000000000001@lid';
+    writeFileSync(path.join(sessionDir, `lid-mapping-${phone}.json`), JSON.stringify(lid.split('@')[0]));
+    writeFileSync(path.join(sessionDir, `lid-mapping-${lid.split('@')[0]}_reverse.json`), JSON.stringify(phone));
+    writeDelegations(sessionDir, {
+      [phone]: { status: 'ACTIVE', expires_at: Date.now() / 1000 + 3600 },
+    });
+
+    const result = await evaluateDelegatedDirectInbound({
+      senderId: lid,
+      chatId: lid,
+      sessionDir,
+      resolveLidToPhone: async () => null,
+    });
+
+    assert.deepEqual(result, { active: true, senderId: lid });
+  });
+});
+
+test('unresolved unmapped direct LID fails closed', async () => {
   await withSessionDirAsync(async (sessionDir) => {
     const lid = '900000000000001@lid';
     writeDelegations(sessionDir, {
