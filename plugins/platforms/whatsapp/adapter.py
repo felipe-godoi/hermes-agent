@@ -25,7 +25,7 @@ import subprocess
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, List, Optional, Any
 
 from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
 from hermes_constants import (
@@ -1320,9 +1320,30 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     }
         except Exception as e:
             logger.debug("Could not get WhatsApp chat info for %s: %s", chat_id, e)
-        
+
         return {"name": chat_id, "type": "dm"}
-    
+
+    def toolsets_for_source(self, source) -> Optional[List[str]]:
+        """Restrict delegated-conversation sessions to their minimal toolset.
+
+        Business logic (the delegation store, TTL, and tool set) lives in
+        the ``whatsapp_delegation`` plugin -- this is just the wire-up so
+        the gateway's existing per-source toolset override
+        (``GatewayRunner._resolve_enabled_toolsets_for_source``) picks it
+        up. Returns ``None`` (normal platform toolset resolution) for
+        every ordinary session, including the owner's own.
+        """
+        try:
+            from plugins.whatsapp_delegation import DELEGATED_TOOLSET
+            from plugins.whatsapp_delegation.store import get_store
+
+            delegation = get_store().get_active_for_contact(source.chat_id or "")
+        except Exception:
+            return None
+        if delegation is None:
+            return None
+        return [DELEGATED_TOOLSET]
+
     async def _poll_messages(self) -> None:
         """Poll the bridge for incoming messages."""
         import aiohttp

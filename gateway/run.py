@@ -16002,6 +16002,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
+        _delegated_admit = False
         if not is_internal:
             try:
                 from hermes_cli.lifecycle import invoke_hook as _invoke_hook
@@ -16038,8 +16039,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
                 if _action == "allow":
                     break
+                if _action == "delegate":
+                    # A plugin independently re-validated an explicit, scoped,
+                    # TTL'd delegation grant for THIS sender (e.g. the
+                    # whatsapp_delegation plugin's active-conversation check)
+                    # and vouches for admitting this one message. This skips
+                    # ONLY the _is_user_authorized() call below, for this one
+                    # message -- the platform's own allowlist
+                    # (WHATSAPP_ALLOWED_USERS, etc.) and _is_user_authorized
+                    # itself are untouched for every other sender and every
+                    # other call site. See pre_gateway_dispatch in
+                    # website/docs/user-guide/features/hooks.md.
+                    _delegated_admit = True
+                    break
 
-        if is_internal:
+        if is_internal or _delegated_admit:
             pass
         elif source.user_id is None:
             # Messages with no user identity (Telegram service messages,

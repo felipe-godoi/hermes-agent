@@ -1,0 +1,13 @@
+name: whatsapp-delegation
+version: 1.0.0
+description: >-
+  Lets an authorized WhatsApp owner delegate a temporary, TTL-bound,
+  tool-restricted conversation to a third-party contact who is NOT in
+  WHATSAPP_ALLOWED_USERS -- without granting that contact normal Hermes
+  access. The delegated contact gets its own isolated session with a
+  minimal toolset; it never inherits the owner's session, tools, or data.
+author: Hermes
+hooks:
+  - pre_gateway_dispatch
+  - pre_llm_call
+  - pre_tool_call
