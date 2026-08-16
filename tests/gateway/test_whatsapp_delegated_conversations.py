@@ -428,3 +428,69 @@ async def test_start_delegated_conversation_creates_record_and_sends_opening_mes
     active = delegation_store.get_active_for_contact(CONTACT_ID)
     assert active is not None
     assert active.owner == "15551234567"  # canonicalized form of OWNER_ID
+
+
+@pytest.mark.asyncio
+async def test_start_delegated_conversation_accepts_formatted_contact_number(
+    monkeypatch, delegation_store
+):
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": {
+            "HERMES_SESSION_PLATFORM": "whatsapp",
+            "HERMES_SESSION_USER_ID": OWNER_ID,
+            "HERMES_SESSION_CHAT_ID": OWNER_ID,
+        }.get(name, default),
+    )
+    send_mock = _patch_live_gateway(monkeypatch)
+    send_mock.return_value = SimpleNamespace(success=True)
+
+    result = await _tool_start_delegated_conversation(
+        {
+            "contact": "+55 34 8426-9133",
+            "objective": "ask about tomorrow",
+            "opening_message": "hello",
+        }
+    )
+
+    assert '"success": true' in result
+    assert '"opening_message_status": "accepted"' in result
+    assert send_mock.await_args.kwargs["chat_id"] == "553484269133@s.whatsapp.net"
+    assert delegation_store.get_active_for_contact("553484269133") is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "adapter_result",
+    [
+        False,
+        {"success": False, "error": "rejected"},
+        {"delivered": False, "error": "not delivered"},
+        SimpleNamespace(success=False, error="rejected"),
+        SimpleNamespace(delivered=False, error="not delivered"),
+    ],
+)
+async def test_start_delegated_conversation_closes_record_when_adapter_rejects_opening_send(
+    monkeypatch, delegation_store, adapter_result
+):
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": {
+            "HERMES_SESSION_PLATFORM": "whatsapp",
+            "HERMES_SESSION_USER_ID": OWNER_ID,
+            "HERMES_SESSION_CHAT_ID": OWNER_ID,
+        }.get(name, default),
+    )
+    send_mock = _patch_live_gateway(monkeypatch)
+    send_mock.return_value = adapter_result
+
+    result = await _tool_start_delegated_conversation(
+        {"contact": CONTACT_ID, "objective": "obj", "opening_message": "hello"}
+    )
+
+    assert '"error"' in result
+    assert '"success": true' not in result
+    closed = delegation_store.list_for_owner(OWNER_ID, include_closed=True)
+    assert len(closed) == 1
+    assert closed[0].status == "CLOSED"
+    assert closed[0].closed_reason == "opening_send_failed"
