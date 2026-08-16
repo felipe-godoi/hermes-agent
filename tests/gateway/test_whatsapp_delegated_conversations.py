@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionSource, build_session_key
 from plugins.whatsapp_delegation import (
     DELEGATED_TOOLSET,
@@ -691,6 +691,29 @@ async def test_start_delegated_conversation_accepts_formatted_contact_number(
     assert '"opening_message_status": "accepted"' in result
     assert send_mock.await_args.kwargs["chat_id"] == "553484269133@s.whatsapp.net"
     assert delegation_store.get_active_for_contact("553484269133") is not None
+
+
+@pytest.mark.asyncio
+async def test_start_delegated_conversation_surfaces_accepted_message_id(
+    monkeypatch, delegation_store
+):
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": {
+            "HERMES_SESSION_PLATFORM": "whatsapp",
+            "HERMES_SESSION_USER_ID": OWNER_ID,
+            "HERMES_SESSION_CHAT_ID": OWNER_ID,
+        }.get(name, default),
+    )
+    send_mock = _patch_live_gateway(monkeypatch)
+    send_mock.return_value = SendResult(success=True, message_id="baileys-local-key")
+
+    result = await _tool_start_delegated_conversation(
+        {"contact": CONTACT_ID, "objective": "obj", "opening_message": "hello"}
+    )
+
+    assert '"opening_message_status": "accepted"' in result
+    assert '"opening_message_id": "baileys-local-key"' in result
 
 
 @pytest.mark.asyncio

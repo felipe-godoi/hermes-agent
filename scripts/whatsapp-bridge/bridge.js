@@ -32,6 +32,7 @@ import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
+import { buildOutboundSendTrace, createOutboundTraceTracker, maskOutboundTarget } from './outbound_trace.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import { delegatedContactTag, evaluateDelegatedInbound } from './delegated_gate.js';
 import { buildIngressTraceEvents } from './ingress_trace.js';
@@ -144,7 +145,8 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
+function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS, timing = null) {
+  const queuedAt = Date.now();
   let timer;
   const timeoutPromise = new Promise((_, reject) => {
     timer = setTimeout(
@@ -152,10 +154,11 @@ function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT
       timeoutMs,
     );
   });
-  return enqueueSend(() =>
-    Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise])
+  return enqueueSend(() => {
+    if (timing) timing.queueWaitMs = Math.max(0, Date.now() - queuedAt);
+    return Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise])
       .finally(() => clearTimeout(timer))
-  );
+  });
 }
 
 function formatOutgoingMessage(message) {
@@ -287,6 +290,9 @@ const MAX_QUEUE_SIZE = 100;
 // Capacity bounded (see outbound_ids.js) to keep memory flat under
 // sustained sending.
 const recentlySentIds = createOutboundIdTracker(512);
+const outboundTrace = createOutboundTraceTracker({
+  emit: event => emitOutboundTrace(event),
+});
 const recentlyProcessedPollUpdates = createOutboundIdTracker(512);
 const messageStore = createBoundedMessageStore(512);
 
@@ -396,6 +402,12 @@ function rememberSentId(id) {
 let sock = null;
 let connectionState = 'disconnected';
 
+function emitOutboundTrace(event) {
+  try {
+    console.log(JSON.stringify({ event: 'whatsapp-outbound-trace', ...event }));
+  } catch {}
+}
+
 function emitPairEvent(event) {
   if (!PAIR_JSON) return;
   try {
@@ -487,6 +499,7 @@ async function startSocket() {
   });
 
   sock.ev.on('messages.update', async (updates) => {
+    outboundTrace.observeMessageUpdates(updates);
     for (const { key, update } of updates || []) {
       if (!update?.pollUpdates) continue;
       const pollCreationId = key?.id || update.pollUpdates?.[0]?.pollCreationMessageKey?.id;
@@ -535,6 +548,10 @@ async function startSocket() {
       });
       enqueuePollUpdateEvent({ key, update: { ...update, pollUpdates }, selectedOptions, aggregation });
     }
+  });
+
+  sock.ev.on('message-receipt.update', receipts => {
+    outboundTrace.observeReceipts(receipts);
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
@@ -868,16 +885,30 @@ app.post('/send', async (req, res) => {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
 
+  const chunks = splitLongMessage(formatOutgoingMessage(message));
+  const startedAt = Date.now();
+  const traceBase = {
+    target_tag: maskOutboundTarget(chatId),
+    message_id: '',
+    chunk_count: chunks.length,
+    queue_wait_ms: 0,
+    elapsed_ms: 0,
+    connection_state: connectionState,
+  };
+  emitOutboundTrace(buildOutboundSendTrace('attempt', traceBase));
+
   try {
-    const chunks = splitLongMessage(formatOutgoingMessage(message));
     const messageIds = [];
+    let queueWaitMs = 0;
     for (let i = 0; i < chunks.length; i += 1) {
       const { content: payload, options } = buildTextSendPayload(chunks[i], {
         chatId,
         replyTo: i === 0 ? replyTo : undefined,
         messageStore,
       });
-      const sent = await sendWithTimeout(chatId, payload, options);
+      const timing = {};
+      const sent = await sendWithTimeout(chatId, payload, options, SEND_TIMEOUT_MS, timing);
+      queueWaitMs += Number.isFinite(timing.queueWaitMs) ? timing.queueWaitMs : 0;
       trackSentMessageId(sent);
       messageStore.remember(sent);
       if (sent?.key?.id) messageIds.push(sent.key.id);
@@ -886,12 +917,27 @@ app.post('/send', async (req, res) => {
       }
     }
 
+    const messageId = messageIds[messageIds.length - 1] || '';
+    for (const id of messageIds) outboundTrace.remember(id);
+    emitOutboundTrace(buildOutboundSendTrace('baileys_accepted', {
+      ...traceBase,
+      message_id: messageId,
+      queue_wait_ms: Math.max(0, Math.floor(queueWaitMs)),
+      elapsed_ms: Math.max(0, Date.now() - startedAt),
+      connection_state: connectionState,
+    }));
+
     res.json({
       success: true,
-      messageId: messageIds[messageIds.length - 1],
+      messageId,
       messageIds,
     });
   } catch (err) {
+    emitOutboundTrace(buildOutboundSendTrace('error', {
+      ...traceBase,
+      elapsed_ms: Math.max(0, Date.now() - startedAt),
+      connection_state: connectionState,
+    }));
     res.status(500).json({ error: err.message });
   }
 });
