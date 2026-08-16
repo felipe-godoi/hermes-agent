@@ -33,7 +33,12 @@ import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { buildOutboundSendTrace, createOutboundTraceTracker, maskOutboundTarget } from './outbound_trace.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
-import { delegatedContactTag, evaluateDelegatedDirectInbound, evaluateDelegatedInbound } from './delegated_gate.js';
+import {
+  delegatedContactTag,
+  emitDelegatedEnqueuedTrace,
+  evaluateDelegatedDirectInbound,
+  evaluateDelegatedInbound,
+} from './delegated_gate.js';
 import { buildIngressTraceEvents } from './ingress_trace.js';
 import { createSilentBaileysLogger, emitSafeBridgeError, safeBridgeError } from './baileys_logger.js';
 import {
@@ -671,6 +676,7 @@ async function startSocket() {
       // Python gateway, otherwise a pairing-code reply fires in response
       // to arbitrary incoming messages (#8389).
       let delegatedInbound = false;
+      let directLidDelegationAttempt = false;
       if (!msg.key.fromMe) {
         if (WHATSAPP_MODE === 'self-chat') {
           try {
@@ -694,18 +700,31 @@ async function startSocket() {
         // mapping is unavailable, only an active persisted alias grant admits
         // the LID. This trace is deliberately limited to this narrow exception.
         if (unlistedNonPairingDm) {
+          const lidMapping = sock.signalRepository?.lidMapping;
+          const resolveLidToPhone = typeof lidMapping?.getPNForLID === 'function'
+            ? lidMapping.getPNForLID.bind(lidMapping)
+            : undefined;
           const delegatedResolution = await evaluateDelegatedDirectInbound({
             senderId,
             chatId,
             sessionDir: SESSION_DIR,
-            resolveLidToPhone: async lid => sock.signalRepository?.lidMapping?.getPNForLID?.(lid),
+            mappingStorePresent: Boolean(lidMapping),
+            resolveLidToPhone,
           });
+          if (delegatedResolution.diagnostic) {
+            directLidDelegationAttempt = true;
+            emitDelegationTrace(delegatedResolution.diagnostic);
+          }
           if (delegatedResolution.active) {
-            delegatedInbound = evaluateDelegatedInbound({
+            delegatedInbound = true;
+            // Direct-LID attempts emit only their identifier-free diagnostic.
+            // Other delegated direct messages retain the established trace pair.
+            evaluateDelegatedInbound({
               senderId: delegatedResolution.senderId,
               sessionDir: SESSION_DIR,
               messageId: msg.key.id,
               emit: emitDelegationTrace,
+              emitLegacyTraces: !directLidDelegationAttempt,
             });
             // Preserve the original LID chatId for replies. A resolver-backed
             // canonical phone is forwarded when available; otherwise the
@@ -832,12 +851,11 @@ async function startSocket() {
       messageStore.remember(msg);
       messageQueue.push(event);
       if (delegatedInbound) {
-        emitDelegationTrace({
-          event: 'whatsapp-delegation-trace',
-          stage: 'bridge_delegation_enqueued',
-          contact: delegatedContactTag(senderId),
+        emitDelegatedEnqueuedTrace({
+          senderId,
           messageId: msg.key.id,
-          action: 'forwarded',
+          emit: emitDelegationTrace,
+          emitLegacyTraces: !directLidDelegationAttempt,
         });
       }
       emitDebugEvent({
