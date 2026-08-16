@@ -42,6 +42,12 @@ logger = logging.getLogger(__name__)
 # full-width digits / Unicode word chars can't sneak through.
 _SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9@.+\-]+$")
 
+# A target that is "just a phone number" — optional leading ``+`` then digits
+# and the usual human separators (spaces, dots, dashes, parens). Anything that
+# already carries an ``@`` is a fully-qualified JID and must pass through
+# untouched (group ``@g.us``, LID ``@lid``, ``status@broadcast`` etc.).
+_BARE_PHONE_RE = re.compile(r"^\+?[\d\s().\-]+$")
+
 from hermes_constants import get_hermes_dir
 
 
@@ -58,20 +64,13 @@ def normalize_whatsapp_identifier(value: str) -> str:
     user-supplied config (phone numbers in ``config.yaml``) without
     worrying about which variant the bridge happens to deliver.
     """
-    return (
-        str(value or "")
-        .strip()
-        .replace("+", "", 1)
-        .split(":", 1)[0]
-        .split("@", 1)[0]
-    )
-
-
-# A target that is "just a phone number" — optional leading ``+`` then digits
-# and the usual human separators (spaces, dots, dashes, parens). Anything that
-# already carries an ``@`` is a fully-qualified JID and must pass through
-# untouched (group ``@g.us``, LID ``@lid``, ``status@broadcast`` etc.).
-_BARE_PHONE_RE = re.compile(r"^\+?[\d\s().\-]+$")
+    raw = str(value or "").strip()
+    if _BARE_PHONE_RE.fullmatch(raw):
+        # Phone numbers are commonly supplied in a human-readable form.  Make
+        # their canonical form agree with to_whatsapp_jid(), which already
+        # accepts the same separators for outbound sends.
+        return re.sub(r"\D+", "", raw)
+    return raw.replace("+", "", 1).split(":", 1)[0].split("@", 1)[0]
 
 
 def to_whatsapp_jid(value: str) -> str:
@@ -199,8 +198,9 @@ def canonical_whatsapp_identifier(identifier: str) -> str:
     if not normalized:
         return ""
 
-    # expand_whatsapp_aliases always includes `normalized` itself in the
-    # returned set, so the min() below degrades gracefully to `normalized`
-    # when no lid-mapping files are present.
+    # expand_whatsapp_aliases normally includes `normalized` itself.  Keep a
+    # local fallback nevertheless: an invalid/unmapped input can be filtered
+    # out by its defensive filename safety check, and canonicalisation must
+    # never turn that into a min(empty) crash.
     aliases = expand_whatsapp_aliases(normalized)
-    return min(aliases, key=lambda candidate: (len(candidate), candidate))
+    return min(aliases or {normalized}, key=lambda candidate: (len(candidate), candidate))
