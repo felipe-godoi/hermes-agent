@@ -584,6 +584,7 @@ async def test_answer_delegated_conversation_sends_verbatim_reply_to_contact(
         owner=OWNER_ID, owner_chat_id=OWNER_ID,
     )
     send_mock = _patch_live_gateway(monkeypatch)
+    send_mock.return_value = SimpleNamespace(success=True, message_id="m1")
 
     result = await _tool_answer_delegated_conversation(
         {"conversation_id": record.id, "answer": "yes, free at 3pm"}
@@ -624,7 +625,8 @@ async def test_answer_delegated_conversation_clears_pending_question_and_records
 
     session_store = MagicMock()
     session_store.lookup_by_session_key.return_value = SimpleNamespace(session_id="sess-1")
-    _patch_live_gateway(monkeypatch, session_store=session_store)
+    send_mock = _patch_live_gateway(monkeypatch, session_store=session_store)
+    send_mock.return_value = SimpleNamespace(success=True, message_id="m1")
 
     result = await _tool_answer_delegated_conversation(
         {"conversation_id": record.id, "answer": "3pm works"}
