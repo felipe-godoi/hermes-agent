@@ -29,6 +29,7 @@ from gateway.session import SessionSource, build_session_key
 from plugins.whatsapp_delegation import (
     DELEGATED_TOOLSET,
     _on_pre_gateway_dispatch,
+    _on_pre_llm_call,
     _on_pre_tool_call,
     _tool_answer_delegated_conversation,
     _tool_ask_owner,
@@ -492,6 +493,32 @@ def test_delegated_session_pre_tool_call_hard_blocks_privileged_tools(delegation
         "gateway.session_context.get_session_env", _fake_session_env(OWNER_ID)
     )
     assert _on_pre_tool_call(tool_name="terminal") is None
+
+
+def test_delegated_session_pre_llm_call_context_has_no_tool_claim_or_third_person_frame(
+    delegation_store, monkeypatch
+):
+    """Fase 4 (F1a/F1c): the plugin's own context must not duplicate or
+    contradict the deployment's identity frame, and must not promise a tool
+    (report_delegated_conversation_result) the model doesn't actually have.
+    """
+    delegation_store.create(
+        contact=CONTACT_ID, objective="ask about tomorrow", ttl_seconds=3600,
+        owner=OWNER_ID, owner_chat_id=OWNER_ID,
+    )
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env", _fake_session_env(CONTACT_ID)
+    )
+
+    result = _on_pre_llm_call(platform="whatsapp", sender_id=CONTACT_ID)
+    assert result is not None
+    context = result["context"]
+    assert "on behalf of your operator" not in context
+    assert "You only have three tools here" not in context
+    assert "report_delegated_conversation_result" not in context
+    assert "ask_owner" in context
+    assert "notify_owner_progress" in context
+    assert "ask about tomorrow" in context
 
 
 # ---------------------------------------------------------------------------
