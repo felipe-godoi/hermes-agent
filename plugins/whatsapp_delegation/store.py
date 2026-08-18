@@ -265,7 +265,12 @@ class DelegatedConversationStore:
         self, conversation_id: str, *, reason: str, outcome: Optional[str] = None
     ) -> Optional[DelegatedConversation]:
         def _apply(record: dict) -> None:
-            record["status"] = STATUS_CLOSED
+            # An already-EXPIRED record must not be silently overwritten back
+            # to CLOSED -- the sweep's status is authoritative once TTL has
+            # passed. Still record that a close was attempted, without
+            # erasing the expiry.
+            if record.get("status") != STATUS_EXPIRED:
+                record["status"] = STATUS_CLOSED
             record["closed_reason"] = reason
             if outcome is not None:
                 record["outcome"] = outcome

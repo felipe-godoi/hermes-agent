@@ -113,6 +113,21 @@ def test_expiry_is_lazy_and_sticky(store):
     )
 
 
+def test_close_does_not_overwrite_an_already_expired_record(store):
+    record = store.create(
+        contact="+19175395595", objective="obj", ttl_seconds=MIN_TTL_SECONDS,
+        owner="owner", owner_chat_id="chat",
+    )
+    data = store._read()  # noqa: SLF001 - white-box test of the sweep
+    data[record.contact]["expires_at"] = time.time() - 1
+    store._write(data)  # noqa: SLF001
+    assert store.get(record.id).status == STATUS_EXPIRED  # lazily swept by get()
+
+    closed = store.close(record.id, reason="closed_by_owner")
+    assert closed.status == STATUS_EXPIRED
+    assert closed.closed_reason == "closed_by_owner"
+
+
 def test_close_sets_status_and_outcome(store):
     record = store.create(
         contact="+19175395595", objective="obj", ttl_seconds=3600,

@@ -468,15 +468,25 @@ async def _tool_close_delegated_conversation(args: dict, **_kwargs) -> str:
     if delegation is None or not delegation.is_active:
         return _tool_error("No active delegated conversation with that id.")
 
+    farewell_ok, farewell_err = True, None
     if farewell_message:
-        await _send_whatsapp(to_whatsapp_jid(delegation.contact), farewell_message)
+        farewell_ok, farewell_err, _delivery_status, _message_id = await _send_whatsapp(
+            to_whatsapp_jid(delegation.contact), farewell_message
+        )
     get_store().close(conversation_id, reason="closed_by_owner")
     await _send_whatsapp(
         delegation.owner_chat_id,
         f"🔒 Delegated conversation with {delegation.contact} closed "
         f"(objective: {delegation.objective}).",
     )
-    return _tool_result(success=True, conversation_id=conversation_id, status="CLOSED")
+    result_kwargs: dict[str, Any] = dict(success=True, conversation_id=conversation_id, status="CLOSED")
+    if not farewell_ok:
+        # The owner's intent to close is honored regardless -- a farewell
+        # delivery failure must not block that -- but the result must not
+        # silently claim the contact was told.
+        result_kwargs["farewell_delivery_failed"] = True
+        result_kwargs["farewell_error"] = farewell_err
+    return _tool_result(**result_kwargs)
 
 
 async def _tool_get_delegated_conversation_status(args: dict, **_kwargs) -> str:
@@ -556,9 +566,13 @@ async def _tool_report_delegated_conversation_result(args: dict, **_kwargs) -> s
         delegation.owner_chat_id,
         f"✅ Delegated conversation finished ({outcome}): {delegation.objective}\n{summary}",
     )
-    get_store().close(delegation.id, reason="completed_by_agent", outcome=outcome)
     if not ok:
-        return _tool_error(f"Closed, but failed to notify the operator: {err}")
+        # Do not close on a failed notification -- that would persist the
+        # outcome nowhere reachable and discard the model's summary. Leaving
+        # the delegation ACTIVE lets this be retried once the operator is
+        # reachable again.
+        return _tool_error(f"Failed to notify the operator: {err}. Not closed -- retry once reachable.")
+    get_store().close(delegation.id, reason="completed_by_agent", outcome=outcome)
     return _tool_result(success=True, conversation_id=delegation.id, status="CLOSED")
 
 

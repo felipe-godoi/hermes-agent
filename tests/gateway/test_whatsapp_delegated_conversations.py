@@ -460,6 +460,12 @@ def test_delegated_session_pre_tool_call_hard_blocks_privileged_tools(delegation
     privileged tool, pre_tool_call independently blocks anything outside the
     three delegated-session tools for any session whose own chat_id has an
     active delegation.
+
+    NOTE (F9): as of this writing the toolset lockdown resolves to an empty
+    (or, after Fase 3.5, a tightly scoped) list before the LLM ever sees a
+    schema, so this hook is defense-in-depth only -- it is not exercised on
+    any reachable production path today. Keep it anyway; the whole point is
+    to survive a future toolset-resolution regression.
     """
     delegation_store.create(
         contact=CONTACT_ID, objective="obj", ttl_seconds=3600,
@@ -630,6 +636,32 @@ async def test_close_delegated_conversation_notifies_owner(monkeypatch, delegati
 
 
 @pytest.mark.asyncio
+async def test_close_delegated_conversation_reports_farewell_failure_but_still_closes(
+    monkeypatch, delegation_store
+):
+    record = delegation_store.create(
+        contact=CONTACT_ID, objective="ask about tomorrow", ttl_seconds=3600,
+        owner=OWNER_ID, owner_chat_id=OWNER_ID,
+    )
+    send_mock = _patch_live_gateway(monkeypatch)
+    send_mock.side_effect = [
+        SimpleNamespace(success=False, error="rejected"),  # farewell to contact
+        SimpleNamespace(success=True),  # notice to owner
+    ]
+
+    result = await _tool_close_delegated_conversation(
+        {"conversation_id": record.id, "farewell_message": "bye for now"}
+    )
+    payload = json.loads(result)
+    assert payload["success"] is True
+    assert payload["farewell_delivery_failed"] is True
+    assert payload["farewell_error"] == "rejected"
+
+    closed = delegation_store.get(record.id)
+    assert closed.status == "CLOSED"
+
+
+@pytest.mark.asyncio
 async def test_close_delegated_conversation_notifies_owner_without_farewell(
     monkeypatch, delegation_store
 ):
@@ -670,6 +702,32 @@ async def test_report_delegated_conversation_result_closes_and_notifies_owner(
     assert closed.outcome == "completed"
     # Once closed, the contact's next message is no longer admitted.
     assert delegation_store.get_active_for_contact(CONTACT_ID) is None
+
+
+@pytest.mark.asyncio
+async def test_report_delegated_conversation_result_does_not_close_when_notify_fails(
+    monkeypatch, delegation_store
+):
+    record = delegation_store.create(
+        contact=CONTACT_ID, objective="ask about tomorrow", ttl_seconds=3600,
+        owner=OWNER_ID, owner_chat_id=OWNER_ID,
+    )
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env", _fake_session_env(CONTACT_ID)
+    )
+    send_mock = _patch_live_gateway(monkeypatch)
+    send_mock.return_value = SimpleNamespace(success=False, error="rejected")
+
+    result = await _tool_report_delegated_conversation_result(
+        {"summary": "he confirmed", "outcome": "completed"}
+    )
+    assert '"error"' in result
+    # The summary/outcome must not be silently lost: the delegation stays
+    # ACTIVE (and reachable for a retry) rather than closing on a failed
+    # notification.
+    still_active = delegation_store.get(record.id)
+    assert still_active.status == "ACTIVE"
+    assert still_active.outcome is None
 
 
 @pytest.mark.asyncio
