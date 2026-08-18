@@ -419,6 +419,8 @@ async def _tool_send_delegated_message(args: dict, **_kwargs) -> str:
 
 
 async def _tool_answer_delegated_conversation(args: dict, **_kwargs) -> str:
+    from gateway.whatsapp_identity import to_whatsapp_jid
+
     conversation_id = str(args.get("conversation_id") or "").strip()
     answer = str(args.get("answer") or "").strip()
     if not conversation_id:
@@ -435,14 +437,21 @@ async def _tool_answer_delegated_conversation(args: dict, **_kwargs) -> str:
         delegation,
         f"[Answer from your operator to your question \"{delegation.pending_question}\"] {answer}",
     )
+    ok, err, delivery_status, message_id = await _send_whatsapp(
+        to_whatsapp_jid(delegation.contact), answer
+    )
+    if not ok:
+        return _tool_error(f"Failed to send answer: {err}")
     return _tool_result(
         success=True,
         conversation_id=conversation_id,
+        delivery_status=delivery_status,
+        message_id=message_id,
         note=(
-            "Answer recorded. It will be used the next time the contact writes."
+            "Answer sent to the contact and recorded for the delegated session's next turn."
             if recorded
-            else "Answer recorded, but the delegated session transcript could "
-            "not be reached; it may not carry forward."
+            else "Answer sent to the contact, but the delegated session transcript could "
+            "not be reached; it may not carry forward as context."
         ),
     )
 
