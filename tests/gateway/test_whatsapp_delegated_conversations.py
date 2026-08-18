@@ -29,8 +29,11 @@ from gateway.session import SessionSource, build_session_key
 from plugins.whatsapp_delegation import (
     DELEGATED_TOOLSET,
     _on_pre_gateway_dispatch,
+    _on_pre_llm_call,
     _on_pre_tool_call,
+    _tool_answer_delegated_conversation,
     _tool_ask_owner,
+    _tool_close_delegated_conversation,
     _tool_notify_owner_progress,
     _tool_report_delegated_conversation_result,
     _tool_start_delegated_conversation,
@@ -458,6 +461,12 @@ def test_delegated_session_pre_tool_call_hard_blocks_privileged_tools(delegation
     privileged tool, pre_tool_call independently blocks anything outside the
     three delegated-session tools for any session whose own chat_id has an
     active delegation.
+
+    NOTE (F9): as of this writing the toolset lockdown resolves to an empty
+    (or, after Fase 3.5, a tightly scoped) list before the LLM ever sees a
+    schema, so this hook is defense-in-depth only -- it is not exercised on
+    any reachable production path today. Keep it anyway; the whole point is
+    to survive a future toolset-resolution regression.
     """
     delegation_store.create(
         contact=CONTACT_ID, objective="obj", ttl_seconds=3600,
@@ -486,18 +495,45 @@ def test_delegated_session_pre_tool_call_hard_blocks_privileged_tools(delegation
     assert _on_pre_tool_call(tool_name="terminal") is None
 
 
+def test_delegated_session_pre_llm_call_context_has_no_tool_claim_or_third_person_frame(
+    delegation_store, monkeypatch
+):
+    """Fase 4 (F1a/F1c): the plugin's own context must not duplicate or
+    contradict the deployment's identity frame, and must not promise a tool
+    (report_delegated_conversation_result) the model doesn't actually have.
+    """
+    delegation_store.create(
+        contact=CONTACT_ID, objective="ask about tomorrow", ttl_seconds=3600,
+        owner=OWNER_ID, owner_chat_id=OWNER_ID,
+    )
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env", _fake_session_env(CONTACT_ID)
+    )
+
+    result = _on_pre_llm_call(platform="whatsapp", sender_id=CONTACT_ID)
+    assert result is not None
+    context = result["context"]
+    assert "on behalf of your operator" not in context
+    assert "You only have three tools here" not in context
+    assert "report_delegated_conversation_result" not in context
+    assert "ask_owner" in context
+    assert "notify_owner_progress" in context
+    assert "ask about tomorrow" in context
+
+
 # ---------------------------------------------------------------------------
 # Tool-handler integration: conversation_id resolution + outbound send
 # ---------------------------------------------------------------------------
 
 
-def _patch_live_gateway(monkeypatch):
+def _patch_live_gateway(monkeypatch, *, session_store=None):
     """Fake `_gateway_runner_ref()` returning a runner with a mocked WhatsApp
     adapter.send, the same seam _send_whatsapp uses in production."""
     send_mock = AsyncMock()
     runner = SimpleNamespace(
         adapters={Platform.WHATSAPP: SimpleNamespace(send=send_mock)},
         _gateway_loop=asyncio.get_running_loop(),
+        session_store=session_store,
     )
     monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
     return send_mock
@@ -540,6 +576,137 @@ async def test_notify_owner_progress_requires_active_delegation(monkeypatch, del
 
 
 @pytest.mark.asyncio
+async def test_answer_delegated_conversation_sends_verbatim_reply_to_contact(
+    monkeypatch, delegation_store
+):
+    record = delegation_store.create(
+        contact=CONTACT_ID, objective="ask about tomorrow", ttl_seconds=3600,
+        owner=OWNER_ID, owner_chat_id=OWNER_ID,
+    )
+    send_mock = _patch_live_gateway(monkeypatch)
+    send_mock.return_value = SimpleNamespace(success=True, message_id="m1")
+
+    result = await _tool_answer_delegated_conversation(
+        {"conversation_id": record.id, "answer": "yes, free at 3pm"}
+    )
+    assert '"success": true' in result
+    send_mock.assert_awaited_once()
+    assert send_mock.await_args.kwargs["chat_id"] == CONTACT_ID
+    assert send_mock.await_args.kwargs["content"] == "yes, free at 3pm"
+
+
+@pytest.mark.asyncio
+async def test_answer_delegated_conversation_returns_failure_when_send_fails(
+    monkeypatch, delegation_store
+):
+    record = delegation_store.create(
+        contact=CONTACT_ID, objective="ask about tomorrow", ttl_seconds=3600,
+        owner=OWNER_ID, owner_chat_id=OWNER_ID,
+    )
+    send_mock = _patch_live_gateway(monkeypatch)
+    send_mock.return_value = SimpleNamespace(success=False, error="rejected")
+
+    result = await _tool_answer_delegated_conversation(
+        {"conversation_id": record.id, "answer": "yes, free at 3pm"}
+    )
+    assert '"error"' in result
+    assert '"success": true' not in result
+
+
+@pytest.mark.asyncio
+async def test_answer_delegated_conversation_clears_pending_question_and_records_transcript_note(
+    monkeypatch, delegation_store
+):
+    record = delegation_store.create(
+        contact=CONTACT_ID, objective="ask about tomorrow", ttl_seconds=3600,
+        owner=OWNER_ID, owner_chat_id=OWNER_ID,
+    )
+    delegation_store.set_pending_question(record.id, "what time works?")
+
+    session_store = MagicMock()
+    session_store.lookup_by_session_key.return_value = SimpleNamespace(session_id="sess-1")
+    send_mock = _patch_live_gateway(monkeypatch, session_store=session_store)
+    send_mock.return_value = SimpleNamespace(success=True, message_id="m1")
+
+    result = await _tool_answer_delegated_conversation(
+        {"conversation_id": record.id, "answer": "3pm works"}
+    )
+    assert '"success": true' in result
+    assert "recorded" in result
+
+    session_store.append_to_transcript.assert_called_once()
+    assert "3pm works" in session_store.append_to_transcript.call_args.args[1]["content"]
+
+    refreshed = delegation_store.get(record.id)
+    assert refreshed.pending_question is None
+
+
+@pytest.mark.asyncio
+async def test_close_delegated_conversation_notifies_owner(monkeypatch, delegation_store):
+    record = delegation_store.create(
+        contact=CONTACT_ID, objective="ask about tomorrow", ttl_seconds=3600,
+        owner=OWNER_ID, owner_chat_id=OWNER_ID,
+    )
+    send_mock = _patch_live_gateway(monkeypatch)
+
+    result = await _tool_close_delegated_conversation(
+        {"conversation_id": record.id, "farewell_message": "bye for now"}
+    )
+    assert '"success": true' in result
+    assert send_mock.await_count == 2
+    farewell_call, owner_call = send_mock.await_args_list
+    assert farewell_call.kwargs["chat_id"] == CONTACT_ID
+    assert farewell_call.kwargs["content"] == "bye for now"
+    assert owner_call.kwargs["chat_id"] == OWNER_ID
+    assert record.contact in owner_call.kwargs["content"]
+
+    closed = delegation_store.get(record.id)
+    assert closed.status == "CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_close_delegated_conversation_reports_farewell_failure_but_still_closes(
+    monkeypatch, delegation_store
+):
+    record = delegation_store.create(
+        contact=CONTACT_ID, objective="ask about tomorrow", ttl_seconds=3600,
+        owner=OWNER_ID, owner_chat_id=OWNER_ID,
+    )
+    send_mock = _patch_live_gateway(monkeypatch)
+    send_mock.side_effect = [
+        SimpleNamespace(success=False, error="rejected"),  # farewell to contact
+        SimpleNamespace(success=True),  # notice to owner
+    ]
+
+    result = await _tool_close_delegated_conversation(
+        {"conversation_id": record.id, "farewell_message": "bye for now"}
+    )
+    payload = json.loads(result)
+    assert payload["success"] is True
+    assert payload["farewell_delivery_failed"] is True
+    assert payload["farewell_error"] == "rejected"
+
+    closed = delegation_store.get(record.id)
+    assert closed.status == "CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_close_delegated_conversation_notifies_owner_without_farewell(
+    monkeypatch, delegation_store
+):
+    record = delegation_store.create(
+        contact=CONTACT_ID, objective="ask about tomorrow", ttl_seconds=3600,
+        owner=OWNER_ID, owner_chat_id=OWNER_ID,
+    )
+    send_mock = _patch_live_gateway(monkeypatch)
+
+    result = await _tool_close_delegated_conversation({"conversation_id": record.id})
+    assert '"success": true' in result
+    send_mock.assert_awaited_once()
+    assert send_mock.await_args.kwargs["chat_id"] == OWNER_ID
+
+
+@pytest.mark.asyncio
 async def test_report_delegated_conversation_result_closes_and_notifies_owner(
     monkeypatch, delegation_store
 ):
@@ -564,6 +731,32 @@ async def test_report_delegated_conversation_result_closes_and_notifies_owner(
     assert closed.outcome == "completed"
     # Once closed, the contact's next message is no longer admitted.
     assert delegation_store.get_active_for_contact(CONTACT_ID) is None
+
+
+@pytest.mark.asyncio
+async def test_report_delegated_conversation_result_does_not_close_when_notify_fails(
+    monkeypatch, delegation_store
+):
+    record = delegation_store.create(
+        contact=CONTACT_ID, objective="ask about tomorrow", ttl_seconds=3600,
+        owner=OWNER_ID, owner_chat_id=OWNER_ID,
+    )
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env", _fake_session_env(CONTACT_ID)
+    )
+    send_mock = _patch_live_gateway(monkeypatch)
+    send_mock.return_value = SimpleNamespace(success=False, error="rejected")
+
+    result = await _tool_report_delegated_conversation_result(
+        {"summary": "he confirmed", "outcome": "completed"}
+    )
+    assert '"error"' in result
+    # The summary/outcome must not be silently lost: the delegation stays
+    # ACTIVE (and reachable for a retry) rather than closing on a failed
+    # notification.
+    still_active = delegation_store.get(record.id)
+    assert still_active.status == "ACTIVE"
+    assert still_active.outcome is None
 
 
 @pytest.mark.asyncio
