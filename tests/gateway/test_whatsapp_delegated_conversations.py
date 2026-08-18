@@ -32,6 +32,7 @@ from plugins.whatsapp_delegation import (
     _on_pre_tool_call,
     _tool_answer_delegated_conversation,
     _tool_ask_owner,
+    _tool_close_delegated_conversation,
     _tool_notify_owner_progress,
     _tool_report_delegated_conversation_result,
     _tool_start_delegated_conversation,
@@ -603,6 +604,45 @@ async def test_answer_delegated_conversation_clears_pending_question_and_records
 
     refreshed = delegation_store.get(record.id)
     assert refreshed.pending_question is None
+
+
+@pytest.mark.asyncio
+async def test_close_delegated_conversation_notifies_owner(monkeypatch, delegation_store):
+    record = delegation_store.create(
+        contact=CONTACT_ID, objective="ask about tomorrow", ttl_seconds=3600,
+        owner=OWNER_ID, owner_chat_id=OWNER_ID,
+    )
+    send_mock = _patch_live_gateway(monkeypatch)
+
+    result = await _tool_close_delegated_conversation(
+        {"conversation_id": record.id, "farewell_message": "bye for now"}
+    )
+    assert '"success": true' in result
+    assert send_mock.await_count == 2
+    farewell_call, owner_call = send_mock.await_args_list
+    assert farewell_call.kwargs["chat_id"] == CONTACT_ID
+    assert farewell_call.kwargs["content"] == "bye for now"
+    assert owner_call.kwargs["chat_id"] == OWNER_ID
+    assert record.contact in owner_call.kwargs["content"]
+
+    closed = delegation_store.get(record.id)
+    assert closed.status == "CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_close_delegated_conversation_notifies_owner_without_farewell(
+    monkeypatch, delegation_store
+):
+    record = delegation_store.create(
+        contact=CONTACT_ID, objective="ask about tomorrow", ttl_seconds=3600,
+        owner=OWNER_ID, owner_chat_id=OWNER_ID,
+    )
+    send_mock = _patch_live_gateway(monkeypatch)
+
+    result = await _tool_close_delegated_conversation({"conversation_id": record.id})
+    assert '"success": true' in result
+    send_mock.assert_awaited_once()
+    assert send_mock.await_args.kwargs["chat_id"] == OWNER_ID
 
 
 @pytest.mark.asyncio

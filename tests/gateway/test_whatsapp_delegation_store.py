@@ -135,6 +135,38 @@ def test_pending_question_set_and_clear(store):
     assert store.get(record.id).pending_question is None
 
 
+def test_sweep_expired_returns_only_newly_transitioned_records(store):
+    stale = store.create(
+        contact="+19175395595", objective="stale", ttl_seconds=MIN_TTL_SECONDS,
+        owner="owner", owner_chat_id="chat",
+    )
+    fresh = store.create(
+        contact="+1222", objective="fresh", ttl_seconds=3600,
+        owner="owner", owner_chat_id="chat",
+    )
+    data = store._read()  # noqa: SLF001 - white-box test of the sweep
+    data[stale.contact]["expires_at"] = time.time() - 1
+    store._write(data)  # noqa: SLF001
+
+    swept = store.sweep_expired()
+    assert [r.id for r in swept] == [stale.id]
+    assert swept[0].status == STATUS_EXPIRED
+    assert swept[0].objective == "stale"
+
+    # The already-EXPIRED record is not returned again on a second sweep,
+    # and an ACTIVE record never appears.
+    assert store.sweep_expired() == []
+    assert store.get(fresh.id).status == STATUS_ACTIVE
+
+
+def test_sweep_expired_returns_empty_list_when_nothing_expired(store):
+    store.create(
+        contact="+19175395595", objective="obj", ttl_seconds=3600,
+        owner="owner", owner_chat_id="chat",
+    )
+    assert store.sweep_expired() == []
+
+
 def test_list_for_owner_scopes_by_owner_and_excludes_closed_by_default(store):
     a = store.create(contact="+1111", objective="a", ttl_seconds=3600, owner="owner-a", owner_chat_id="c")
     store.create(contact="+2222", objective="b", ttl_seconds=3600, owner="owner-b", owner_chat_id="c")

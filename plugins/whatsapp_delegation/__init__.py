@@ -471,6 +471,11 @@ async def _tool_close_delegated_conversation(args: dict, **_kwargs) -> str:
     if farewell_message:
         await _send_whatsapp(to_whatsapp_jid(delegation.contact), farewell_message)
     get_store().close(conversation_id, reason="closed_by_owner")
+    await _send_whatsapp(
+        delegation.owner_chat_id,
+        f"🔒 Delegated conversation with {delegation.contact} closed "
+        f"(objective: {delegation.objective}).",
+    )
     return _tool_result(success=True, conversation_id=conversation_id, status="CLOSED")
 
 

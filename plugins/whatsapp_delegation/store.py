@@ -112,14 +112,20 @@ class DelegatedConversationStore:
         atomic_json_write(self._path, data, mode=0o600)
 
     @staticmethod
-    def _sweep_expired_locked(data: dict) -> bool:
+    def _sweep_expired_locked(data: dict) -> list[dict]:
+        """Mark ACTIVE records past their TTL as EXPIRED in place.
+
+        Returns the raw records that just made that transition. An empty
+        list is falsy, so every existing ``if self._sweep_expired_locked(data):``
+        call site below keeps working unchanged under this widened return type.
+        """
         now = time.time()
-        changed = False
+        newly_expired = []
         for record in data.values():
             if record.get("status") == STATUS_ACTIVE and record.get("expires_at", 0) < now:
                 record["status"] = STATUS_EXPIRED
-                changed = True
-        return changed
+                newly_expired.append(record)
+        return newly_expired
 
     # -- create / read ---------------------------------------------------
 
@@ -214,6 +220,25 @@ class DelegatedConversationStore:
                     continue
                 out.append(DelegatedConversation.from_dict(record))
         return out
+
+    def sweep_expired(self) -> list[DelegatedConversation]:
+        """Actively sweep every record for TTL expiry, returning the ones
+        that just transitioned ACTIVE -> EXPIRED in this call.
+
+        The sweep baked into every read method above is lazy and
+        read-triggered: an expiry is only ever *detected* the next time
+        something happens to read that exact contact, which may never
+        happen again. This store has no event loop of its own to run a
+        timer on, so a caller with one (the gateway hook) is expected to
+        invoke this periodically to make expiry visible without depending
+        on another read.
+        """
+        with self._lock:
+            data = self._read()
+            newly_expired = self._sweep_expired_locked(data)
+            if newly_expired:
+                self._write(data)
+            return [DelegatedConversation.from_dict(record) for record in newly_expired]
 
     # -- mutate ------------------------------------------------------------
 
