@@ -41,6 +41,7 @@ import {
 } from './delegated_gate.js';
 import { buildIngressTraceEvents } from './ingress_trace.js';
 import { createSilentBaileysLogger, emitSafeBridgeError, safeBridgeError } from './baileys_logger.js';
+import { resolveOutboundSendTarget, WhatsAppNotRegisteredError } from './lid_resolution.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
@@ -303,6 +304,11 @@ const outboundTrace = createOutboundTraceTracker({
 });
 const recentlyProcessedPollUpdates = createOutboundIdTracker(512);
 const messageStore = createBoundedMessageStore(512);
+
+// PN -> bare LID (or null when the contact has no LID) learned this session,
+// so repeat sends to the same phone JID skip the usync lookup. See
+// lid_resolution.js for the resolution/persistence logic.
+const lidResolutionCache = new Map();
 
 function normalizePollUpdateOptions(aggregation, pollUpdateMessage, meId) {
   const selected = [];
@@ -875,6 +881,15 @@ async function startSocket() {
   });
 }
 
+function resolveSendTarget(chatId) {
+  return resolveOutboundSendTarget({
+    chatId,
+    sock,
+    sessionDir: SESSION_DIR,
+    cache: lidResolutionCache,
+  });
+}
+
 // HTTP server
 const app = express();
 app.use(express.json());
@@ -927,10 +942,20 @@ app.post('/send', async (req, res) => {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
 
+  let sendTarget;
+  try {
+    sendTarget = await resolveSendTarget(chatId);
+  } catch (err) {
+    if (err instanceof WhatsAppNotRegisteredError) {
+      return res.status(422).json({ error: err.message });
+    }
+    return res.status(500).json({ error: safeBridgeError(err).message });
+  }
+
   const chunks = splitLongMessage(formatOutgoingMessage(message));
   const startedAt = Date.now();
   const traceBase = {
-    target_tag: maskOutboundTarget(chatId),
+    target_tag: maskOutboundTarget(sendTarget),
     message_id: '',
     chunk_count: chunks.length,
     queue_wait_ms: 0,
@@ -944,12 +969,12 @@ app.post('/send', async (req, res) => {
     let queueWaitMs = 0;
     for (let i = 0; i < chunks.length; i += 1) {
       const { content: payload, options } = buildTextSendPayload(chunks[i], {
-        chatId,
+        chatId: sendTarget,
         replyTo: i === 0 ? replyTo : undefined,
         messageStore,
       });
       const timing = {};
-      const sent = await sendWithTimeout(chatId, payload, options, SEND_TIMEOUT_MS, timing);
+      const sent = await sendWithTimeout(sendTarget, payload, options, SEND_TIMEOUT_MS, timing);
       queueWaitMs += Number.isFinite(timing.queueWaitMs) ? timing.queueWaitMs : 0;
       trackSentMessageId(sent);
       messageStore.remember(sent);
@@ -1027,6 +1052,16 @@ app.post('/send-media', async (req, res) => {
   const { chatId, filePath, mediaType, caption, fileName } = req.body;
   if (!chatId || !filePath) {
     return res.status(400).json({ error: 'chatId and filePath are required' });
+  }
+
+  let sendTarget;
+  try {
+    sendTarget = await resolveSendTarget(chatId);
+  } catch (err) {
+    if (err instanceof WhatsAppNotRegisteredError) {
+      return res.status(422).json({ error: err.message });
+    }
+    return res.status(500).json({ error: safeBridgeError(err).message });
   }
 
   try {
@@ -1108,7 +1143,7 @@ app.post('/send-media', async (req, res) => {
         break;
     }
 
-    const sent = await sendWithTimeout(chatId, msgPayload);
+    const sent = await sendWithTimeout(sendTarget, msgPayload);
     trackSentMessageId(sent);
     messageStore.remember(sent);
     res.json({ success: true, messageId: sent?.key?.id });
