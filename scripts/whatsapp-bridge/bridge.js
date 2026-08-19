@@ -890,6 +890,17 @@ function resolveSendTarget(chatId) {
   });
 }
 
+// LID resolution failures (422/503) never reach a Baileys send call, so
+// without this they're invisible to whatsapp-outbound-trace consumers -
+// masked on the original chatId since resolution never produced a target.
+function emitResolutionErrorTrace(chatId, err) {
+  emitOutboundTrace(buildOutboundSendTrace('error', {
+    target_tag: maskOutboundTarget(chatId),
+    error: err.name,
+    connection_state: connectionState,
+  }));
+}
+
 // HTTP server
 const app = express();
 app.use(express.json());
@@ -947,9 +958,11 @@ app.post('/send', async (req, res) => {
     resolution = await resolveSendTarget(chatId);
   } catch (err) {
     if (err instanceof WhatsAppNotRegisteredError) {
+      emitResolutionErrorTrace(chatId, err);
       return res.status(422).json({ error: err.message });
     }
     if (err instanceof LidUnavailableError) {
+      emitResolutionErrorTrace(chatId, err);
       return res.status(503).json({ error: err.message });
     }
     return res.status(500).json({ error: safeBridgeError(err).message });
@@ -1065,9 +1078,11 @@ app.post('/send-media', async (req, res) => {
     sendTarget = (await resolveSendTarget(chatId)).target;
   } catch (err) {
     if (err instanceof WhatsAppNotRegisteredError) {
+      emitResolutionErrorTrace(chatId, err);
       return res.status(422).json({ error: err.message });
     }
     if (err instanceof LidUnavailableError) {
+      emitResolutionErrorTrace(chatId, err);
       return res.status(503).json({ error: err.message });
     }
     return res.status(500).json({ error: safeBridgeError(err).message });

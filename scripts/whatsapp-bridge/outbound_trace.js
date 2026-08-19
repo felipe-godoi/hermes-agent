@@ -7,6 +7,12 @@
 
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
 
+// The only `error` values a trace may ever carry: Error `.name`s from
+// lid_resolution.js, never `.message`/`.stack`. Anything else collapses to
+// `unknown_error` so a future caller passing a raw Baileys error by mistake
+// can't reintroduce the leak this module is built to prevent.
+const SAFE_ERROR_NAMES = new Set(['WhatsAppNotRegisteredError', 'LidUnavailableError']);
+
 function safeNumber(value) {
   return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
 }
@@ -20,9 +26,11 @@ export function maskOutboundTarget(value) {
 }
 
 /** Return the allowlisted shape for a /send lifecycle trace.
- * `resolution_source` / `lid_resolved` are optional (set by the caller for
- * the `attempt` / `baileys_accepted` stages) and only appear when provided,
- * so callers that don't pass them keep the original trace shape. */
+ * `resolution_source` / `lid_resolved` / `error` are optional (set by the
+ * caller as applicable per stage) and only appear when provided, so callers
+ * that don't pass them keep the original trace shape. `error` is always an
+ * Error `.name` (e.g. `LidUnavailableError`), never a raw message or stack -
+ * this trace must never carry contact identities or message content. */
 export function buildOutboundSendTrace(stage, fields = {}) {
   const trace = {
     stage,
@@ -38,6 +46,10 @@ export function buildOutboundSendTrace(stage, fields = {}) {
   }
   if (fields.lid_resolved !== undefined) {
     trace.lid_resolved = Boolean(fields.lid_resolved);
+  }
+  if (fields.error !== undefined) {
+    const name = String(fields.error);
+    trace.error = SAFE_ERROR_NAMES.has(name) ? name : 'unknown_error';
   }
   return trace;
 }

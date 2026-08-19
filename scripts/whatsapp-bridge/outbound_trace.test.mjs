@@ -8,14 +8,22 @@ assert.equal(maskOutboundTarget('15551234567@g.us'), 'group:…4567');
 const attempt = buildOutboundSendTrace('attempt', {
   target_tag: 'jid:…4567', message_id: 'msg-1', chunk_count: 2,
   queue_wait_ms: 4.9, elapsed_ms: 8.1, connection_state: 'connected',
-  message: 'private body', error: 'private raw error', remoteJid: '15551234567@s.whatsapp.net',
+  message: 'private body', remoteJid: '15551234567@s.whatsapp.net',
 });
 assert.deepStrictEqual(attempt, {
   stage: 'attempt', target_tag: 'jid:…4567', message_id: 'msg-1', chunk_count: 2,
   queue_wait_ms: 4, elapsed_ms: 8, connection_state: 'connected',
 });
-const failed = buildOutboundSendTrace('error', { target_tag: 'jid:…4567', error: 'secret raw error' });
-assert.equal(JSON.stringify(failed).includes('secret raw error'), false, 'raw send errors are never traced');
+
+const failed = buildOutboundSendTrace('error', { target_tag: 'jid:…4567', error: 'secret raw error text from Baileys' });
+assert.equal(JSON.stringify(failed).includes('secret raw error text from Baileys'), false, 'raw send errors are never traced');
+assert.equal(failed.error, 'unknown_error', 'an unrecognized error value collapses to a safe placeholder, never passes through raw');
+
+const lidUnavailableFailed = buildOutboundSendTrace('error', { target_tag: 'jid:…4567', error: 'LidUnavailableError' });
+assert.equal(lidUnavailableFailed.error, 'LidUnavailableError', 'known-safe error class names (never .message/.stack) pass through');
+
+const notRegisteredFailed = buildOutboundSendTrace('error', { target_tag: 'jid:…4567', error: 'WhatsAppNotRegisteredError' });
+assert.equal(notRegisteredFailed.error, 'WhatsAppNotRegisteredError');
 
 let clock = 1_000;
 const events = [];
