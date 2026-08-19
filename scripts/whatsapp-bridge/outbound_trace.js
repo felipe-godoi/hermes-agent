@@ -19,9 +19,12 @@ export function maskOutboundTarget(value) {
   return `${kind}:…${suffix}`;
 }
 
-/** Return the allowlisted shape for a /send lifecycle trace. */
+/** Return the allowlisted shape for a /send lifecycle trace.
+ * `resolution_source` / `lid_resolved` are optional (set by the caller for
+ * the `attempt` / `baileys_accepted` stages) and only appear when provided,
+ * so callers that don't pass them keep the original trace shape. */
 export function buildOutboundSendTrace(stage, fields = {}) {
-  return {
+  const trace = {
     stage,
     target_tag: String(fields.target_tag || 'unknown'),
     message_id: String(fields.message_id || ''),
@@ -30,6 +33,13 @@ export function buildOutboundSendTrace(stage, fields = {}) {
     elapsed_ms: safeNumber(fields.elapsed_ms),
     connection_state: String(fields.connection_state || 'unknown'),
   };
+  if (fields.resolution_source !== undefined) {
+    trace.resolution_source = String(fields.resolution_source);
+  }
+  if (fields.lid_resolved !== undefined) {
+    trace.lid_resolved = Boolean(fields.lid_resolved);
+  }
+  return trace;
 }
 
 function messageIdFrom(event) {

@@ -23,6 +23,23 @@ export class WhatsAppNotRegisteredError extends Error {
   }
 }
 
+/**
+ * Thrown when a phone number is confirmed registered on WhatsApp but no
+ * PN<->LID mapping could be obtained by any of the available paths. Sending
+ * to the raw phone JID in this state is known to be accepted locally by
+ * Baileys and then rejected server-side (baileys_status 0), so the caller
+ * must surface this instead of silently falling back.
+ */
+export class LidUnavailableError extends Error {
+  constructor(jid) {
+    super('This number is registered on WhatsApp but its LID mapping is unavailable right now.');
+    this.name = 'LidUnavailableError';
+    this.jid = jid;
+  }
+}
+
+const POST_USYNC_RETRY_MS = 1500;
+
 function lidMappingPath(sessionDir, phone) {
   return path.join(sessionDir, `lid-mapping-${phone}.json`);
 }
@@ -58,19 +75,48 @@ function toLidJid(bareLid) {
   return bareLid ? `${bareLid}@lid` : null;
 }
 
+async function consultLidMapping(sock, chatId) {
+  const lidMapping = sock?.signalRepository?.lidMapping;
+  if (typeof lidMapping?.getLIDForPN !== 'function') return null;
+  try {
+    return normalizeWhatsAppIdentifier(await lidMapping.getLIDForPN(chatId)) || null;
+  } catch {
+    return null;
+  }
+}
+
+function defaultWait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 /**
  * Resolve the actual Baileys send target for an outbound message.
  *
  * - Non-phone-JID targets (group, LID, broadcast, ...) pass through
  *   unchanged.
- * - Phone JIDs are resolved PN->LID: first an in-memory cache, then the
- *   locally persisted mapping file, then (only if neither has it) a usync
- *   lookup via `sock.onWhatsApp()` that also establishes the session.
- * - Sends to the LID when the contact has one; otherwise falls back to the
- *   original phone JID.
- * - Throws `WhatsAppNotRegisteredError` when usync reports the number does
- *   not exist on WhatsApp, so the caller can answer with a clear 4xx instead
- *   of accepting the send and letting it fail silently later.
+ * - Phone JIDs are resolved PN->LID through, in order:
+ *     1. `cache`      - in-memory cache from a prior resolution this session.
+ *     2. `signal-repo`- `sock.signalRepository.lidMapping.getLIDForPN()`.
+ *     3. `file`       - the locally persisted `lid-mapping-<phone>.json`.
+ *     4. a `sock.onWhatsApp()` usync call to confirm the number is even
+ *        registered. Baileys 7.0.0-rc13's `onWhatsApp()` only ever returns
+ *        `{ jid, exists }` - it never includes a `lid` field, so this step
+ *        cannot resolve the LID by itself. When `exists` is false, throws
+ *        `WhatsAppNotRegisteredError`.
+ *     5. If it exists, the first usync for a new contact typically
+ *        provisions the PN<->LID mapping on the server asynchronously. Wait
+ *        ~1.5s and re-consult `signal-repo` (source `lid-usync`) then `file`
+ *        (source `contact-usync`).
+ * - Only non-null LIDs are cached; a resolution that ends without a LID is
+ *   never cached, so the next attempt (e.g. a retry) re-runs the full
+ *   lookup instead of being poisoned by a stale miss.
+ * - Never falls back to sending to the raw phone JID once a number is known
+ *   to be registered: that has been observed to be accepted locally by
+ *   Baileys and then rejected by the WhatsApp server. If no LID can be
+ *   found after the retry, throws `LidUnavailableError` instead.
+ *
+ * Returns `{ target, source, lidResolved }` where `source` is one of
+ * `passthrough | cache | signal-repo | file | lid-usync | contact-usync`.
  */
 export async function resolveOutboundSendTarget({
   chatId,
@@ -78,47 +124,60 @@ export async function resolveOutboundSendTarget({
   sessionDir,
   cache,
   onWhatsApp,
+  wait,
 } = {}) {
   if (!isPhoneJid(chatId)) {
-    return chatId;
+    return { target: chatId, source: 'passthrough', lidResolved: typeof chatId === 'string' && chatId.endsWith('@lid') };
   }
 
   const phone = normalizeWhatsAppIdentifier(chatId);
-  if (!phone) return chatId;
-
-  if (cache?.has(phone)) {
-    return toLidJid(cache.get(phone)) || chatId;
+  if (!phone) {
+    return { target: chatId, source: 'passthrough', lidResolved: false };
   }
 
-  const lidMapping = sock?.signalRepository?.lidMapping;
-  let bareLid = null;
-  if (typeof lidMapping?.getLIDForPN === 'function') {
-    try {
-      bareLid = normalizeWhatsAppIdentifier(await lidMapping.getLIDForPN(chatId)) || null;
-    } catch {
-      bareLid = null;
-    }
+  if (cache?.has(phone) && cache.get(phone)) {
+    return { target: toLidJid(cache.get(phone)), source: 'cache', lidResolved: true };
   }
+
+  let bareLid = await consultLidMapping(sock, chatId);
+  let source = bareLid ? 'signal-repo' : null;
+
   if (!bareLid) {
     bareLid = readLocalLidMapping(sessionDir, phone);
+    if (bareLid) source = 'file';
   }
 
   if (!bareLid) {
     const lookup = typeof onWhatsApp === 'function' ? onWhatsApp : sock?.onWhatsApp?.bind(sock);
     if (typeof lookup !== 'function') {
-      return chatId;
+      return { target: chatId, source: 'passthrough', lidResolved: false };
     }
     const results = await lookup(chatId);
     const result = Array.isArray(results) ? results[0] : results;
     if (!result?.exists) {
       throw new WhatsAppNotRegisteredError(chatId);
     }
-    bareLid = normalizeWhatsAppIdentifier(result.lid) || null;
+
+    const sleep = typeof wait === 'function' ? wait : defaultWait;
+    await sleep(POST_USYNC_RETRY_MS);
+
+    bareLid = await consultLidMapping(sock, chatId);
+    if (bareLid) {
+      source = 'lid-usync';
+    } else {
+      bareLid = readLocalLidMapping(sessionDir, phone);
+      if (bareLid) source = 'contact-usync';
+    }
+
     if (bareLid) {
       writeLocalLidMapping(sessionDir, phone, bareLid);
     }
   }
 
+  if (!bareLid) {
+    throw new LidUnavailableError(chatId);
+  }
+
   cache?.set(phone, bareLid);
-  return toLidJid(bareLid) || chatId;
+  return { target: toLidJid(bareLid), source, lidResolved: true };
 }

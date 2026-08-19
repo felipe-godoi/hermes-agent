@@ -41,7 +41,7 @@ import {
 } from './delegated_gate.js';
 import { buildIngressTraceEvents } from './ingress_trace.js';
 import { createSilentBaileysLogger, emitSafeBridgeError, safeBridgeError } from './baileys_logger.js';
-import { resolveOutboundSendTarget, WhatsAppNotRegisteredError } from './lid_resolution.js';
+import { resolveOutboundSendTarget, WhatsAppNotRegisteredError, LidUnavailableError } from './lid_resolution.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
@@ -942,20 +942,26 @@ app.post('/send', async (req, res) => {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
 
-  let sendTarget;
+  let resolution;
   try {
-    sendTarget = await resolveSendTarget(chatId);
+    resolution = await resolveSendTarget(chatId);
   } catch (err) {
     if (err instanceof WhatsAppNotRegisteredError) {
       return res.status(422).json({ error: err.message });
     }
+    if (err instanceof LidUnavailableError) {
+      return res.status(503).json({ error: err.message });
+    }
     return res.status(500).json({ error: safeBridgeError(err).message });
   }
+  const sendTarget = resolution.target;
 
   const chunks = splitLongMessage(formatOutgoingMessage(message));
   const startedAt = Date.now();
   const traceBase = {
     target_tag: maskOutboundTarget(sendTarget),
+    resolution_source: resolution.source,
+    lid_resolved: resolution.lidResolved,
     message_id: '',
     chunk_count: chunks.length,
     queue_wait_ms: 0,
@@ -1056,10 +1062,13 @@ app.post('/send-media', async (req, res) => {
 
   let sendTarget;
   try {
-    sendTarget = await resolveSendTarget(chatId);
+    sendTarget = (await resolveSendTarget(chatId)).target;
   } catch (err) {
     if (err instanceof WhatsAppNotRegisteredError) {
       return res.status(422).json({ error: err.message });
+    }
+    if (err instanceof LidUnavailableError) {
+      return res.status(503).json({ error: err.message });
     }
     return res.status(500).json({ error: safeBridgeError(err).message });
   }
