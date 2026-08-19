@@ -12,10 +12,10 @@ import {
   writeLocalLidMapping,
 } from './lid_resolution.js';
 
-function withSessionDir(fn) {
+async function withSessionDir(fn) {
   const sessionDir = mkdtempSync(path.join(os.tmpdir(), 'hermes-wa-lid-resolution-'));
   try {
-    return fn(sessionDir);
+    return await fn(sessionDir);
   } finally {
     rmSync(sessionDir, { recursive: true, force: true });
   }
